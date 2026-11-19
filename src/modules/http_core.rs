@@ -772,6 +772,7 @@ mod tests {
             listens: Vec::new(),
             server_names: vec!["example.com".into(), "*.example.org".into()],
             locations: Vec::new(),
+            http2: false,
         };
         assert!(server_matches(&server, "example.com"));
         assert!(server_matches(&server, "a.example.org"));

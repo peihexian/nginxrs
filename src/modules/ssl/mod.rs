@@ -104,7 +104,12 @@ impl Module for SslModule {
             spec("ssl_ciphers", &[Context::Server], ssl_ciphers),
             spec("ssl_buffer_size", &[Context::Server], ssl_buffer_size),
             spec("ssl_verify_client", &[Context::Server], ssl_verify_client),
-            spec("ssl_verify_depth", &[Context::Server], ssl_verify_depth),
+            // `ssl_verify_depth` is also accepted in `http {}` (merged down like Nginx).
+            spec(
+                "ssl_verify_depth",
+                &[Context::Http, Context::Server],
+                ssl_verify_depth,
+            ),
             spec(
                 "ssl_client_certificate",
                 &[Context::Server],
@@ -157,13 +162,6 @@ impl Module for SslModule {
             // `ssl` on `listen` is compiled by the HTTP core module.
             spec("ssl", &[Context::Server], unsupported),
         ];
-        // `http {}`-level forms: Nginx accepts `ssl_verify_depth` and the session
-        // directives there and merges them down.
-        specs.push(DirectiveSpec {
-            name: "ssl_verify_depth",
-            contexts: &[Context::Http, Context::Server],
-            handler: ssl_verify_depth,
-        });
         specs
     }
 }
@@ -868,6 +866,62 @@ fn ssl_ocsp_cache(view: &mut crate::modules::DirectiveView<'_>) -> Result<()> {
     let _ = name;
     Ok(())
 }
+
+/// Build the virtual-host table of one TLS listener address.
+///
+/// Returns the SNI-routable servers plus the handshake buffer size, or `None` when the
+/// address has no `listen ... ssl`.
+pub fn virtual_hosts(
+    config: &crate::config::Config,
+    runtime: &RuntimeTls,
+    address: &str,
+) -> Option<(config::TlsVirtualHosts, usize)> {
+    let mut servers = Vec::new();
+    let mut default = 0usize;
+    let mut buffer = 16 * 1024;
+    for (index, server) in config.http.servers.iter().enumerate() {
+        let listens = server
+            .listens
+            .iter()
+            .filter(|listen| listen.address == address && listen.tls)
+            .collect::<Vec<_>>();
+        if listens.is_empty() {
+            continue;
+        }
+        let Some(server_config) = runtime.servers.get(&index) else {
+            continue;
+        };
+        if listens.iter().any(|listen| listen.default_server) {
+            default = servers.len();
+        }
+        if let Some(state) = config
+            .module_states
+            .get::<SslModuleState>(MODULE_NAME)
+            .and_then(|state| state.server(index))
+        {
+            buffer = state.settings().buffer_size;
+        }
+        servers.push(config::TlsVirtualServer {
+            index,
+            server_names: server.server_names.clone(),
+            config: server_config.clone(),
+        });
+    }
+    if servers.is_empty() {
+        return None;
+    }
+    Some((
+        config::TlsVirtualHosts {
+            servers,
+            default,
+            provider: runtime.provider.clone(),
+        },
+        buffer,
+    ))
+}
+
+/// Index of the server whose directives are being parsed.
+pub type SslState = SslModuleState;
 
 /// Ensure the module state is reachable from the compiler (used by `http_core`).
 pub fn state_ref<'a>(access: &'a crate::core::state::StateRead<'_>) -> Option<&'a SslModuleState> {

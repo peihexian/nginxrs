@@ -71,7 +71,9 @@ impl CertSelector {
                     && sni.ends_with(suffix.as_str())
                     && !sni[..sni.len() - suffix.len()].contains('.')
             }
-            Self::Suffix(suffix) => sni.ends_with(suffix.as_str()) && sni.len() >= suffix.len(),
+            Self::Suffix(suffix) => {
+                sni == suffix.trim_start_matches('.') || sni.ends_with(suffix.as_str())
+            }
             Self::Regex(regex) => regex.is_match(sni),
         }
     }
@@ -505,19 +507,22 @@ mod tests {
 
     #[test]
     fn selectors_parse_nginx_forms() {
-        assert_eq!(CertSelector::parse("default").unwrap(), CertSelector::Default);
-        assert_eq!(
+        assert!(matches!(
+            CertSelector::parse("default").unwrap(),
+            CertSelector::Default
+        ));
+        assert!(matches!(
             CertSelector::parse("Example.COM").unwrap(),
-            CertSelector::Hash("example.com".into())
-        );
-        assert_eq!(
+            CertSelector::Hash(name) if name == "example.com"
+        ));
+        assert!(matches!(
             CertSelector::parse("*.example.com").unwrap(),
-            CertSelector::Wildcard(".example.com".into())
-        );
-        assert_eq!(
+            CertSelector::Wildcard(suffix) if suffix == ".example.com"
+        ));
+        assert!(matches!(
             CertSelector::parse(".example.com").unwrap(),
-            CertSelector::Suffix(".example.com".into())
-        );
+            CertSelector::Suffix(suffix) if suffix == ".example.com"
+        ));
         assert!(matches!(
             CertSelector::parse("~^www\\d+\\.example\\.com$").unwrap(),
             CertSelector::Regex(_)

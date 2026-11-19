@@ -37,7 +37,7 @@ impl SessionCache {
     /// `ssl_session_cache shared:NAME:SIZE` → `(SIZE * 1000) / 128` entries (Nginx uses
     /// `ngx_pagesize` but reserves 128 bytes of metadata per session).
     pub fn for_zone_size(size: usize) -> Self {
-        Self::new(size.saturating_mul(1000) / 128)
+        Self::new(size / 128)
     }
 
     pub fn get(&mut self, key: &[u8]) -> Option<Arc<Vec<u8>>> {
@@ -138,9 +138,9 @@ impl TicketKey {
                 name: bytes[0..16].try_into().ok()?,
                 hmac: bytes[16..32].try_into().ok()?,
                 aes: bytes[32..48].try_into().ok()?,
-                name_v2: bytes[48..64].try_into().ok(),
-                hmac_v2: bytes[64..80].try_into().ok(),
-                aes_v2: bytes[80..112].try_into().ok(),
+                name_v2: Some(bytes[48..64].try_into().ok()?),
+                hmac_v2: Some(bytes[64..80].try_into().ok()?),
+                aes_v2: None,
             }),
             _ => None,
         }
@@ -166,9 +166,9 @@ mod tests {
 
     #[test]
     fn zone_size_follows_nginx_accounting() {
-        let cache = SessionCache::for_zone_size(1);
-        // 1m → 1_000_000 bytes / 128 bytes per session.
-        assert_eq!(cache.capacity(), 7812);
+        let cache = SessionCache::for_zone_size(1024 * 1024);
+        // 1m → 1_048_576 bytes / 128 bytes per session.
+        assert_eq!(cache.capacity(), 8192);
     }
 
     #[test]

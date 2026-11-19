@@ -1,13 +1,13 @@
-//! The HTTP request engine.
+﻿//! The HTTP request engine.
 //!
 //! This is the only place that knows the order of Nginx phases; concrete behaviour lives
 //! in modules:
 //!
-//! 1. `POST_READ` — `realip` rewrites `$remote_addr` before configuration lookup.
-//! 2. `FIND_CONFIG` — server and location selection.
-//! 3. `REWRITE` — rewrite rules, restarting lookup on `last`.
-//! 4. `CONTENT` — `return`, Lua, `proxy_pass` or static files.
-//! 5. Response header filter — proxy hide/add headers plus the Lua header filter.
+//! 1. `POST_READ` 闂?`realip` rewrites `$remote_addr` before configuration lookup.
+//! 2. `FIND_CONFIG` 闂?server and location selection.
+//! 3. `REWRITE` 闂?rewrite rules, restarting lookup on `last`.
+//! 4. `CONTENT` 闂?`return`, Lua, `proxy_pass` or static files.
+//! 5. Response header filter 闂?proxy hide/add headers plus the Lua header filter.
 
 use crate::SERVER_NAME;
 use crate::core::http::{ConnectionState, RequestLine, RequestState, RequestStateView};
@@ -40,7 +40,7 @@ use std::sync::Arc;
 /// Everything the engine needs from the compiled configuration.
 pub struct Engine {
     pub servers: Vec<ServerRuntime>,
-    /// Listener → server indices plus the default server index.
+    /// Listener 闂?server indices plus the default server index.
     pub listeners: BTreeMap<String, VirtualHosts>,
     pub upstreams: HashMap<String, Arc<Upstream>>,
     pub providers: &'static [(
@@ -89,6 +89,19 @@ pub struct RequestContext {
     pub host: String,
     pub server_name: String,
     pub started: std::time::Instant,
+    /// TLS handshake facts of the downstream connection (`$ssl_*`), `None` on plain HTTP.
+    pub ssl: Option<Arc<crate::modules::ssl::variables::SslSession>>,
+    /// `server {}` selected by SNI at handshake time (`ngx_http_ssl_servername`).
+    pub ssl_server: Option<usize>,
+}
+
+/// Result of the request phase engine (`ngx_http_core_run_phases`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseOutcome {
+    /// A response was written to the client.
+    Answered,
+    /// The `proxy_pass` content handler applies: hand the request to the proxy pipeline.
+    Proxy,
 }
 
 pub struct HttpCoreApp {
@@ -131,67 +144,311 @@ impl ListenerTls {
 }
 
 impl HttpCoreApp {
-    pub fn new(engine: Arc<ArcSwap<Engine>>, listen: String) -> Self {
-        Self {
-            engine,
-            listen,
-            tls: None,
+    /// The Nginx phase engine for one request (`ngx_http_core_run_phases`).
+    ///
+    /// POST_READ -> FIND_CONFIG -> REWRITE -> PREACCESS -> ACCESS -> CONTENT.
+    pub async fn route_request(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+    ) -> Result<PhaseOutcome> {
+        // Snapshot the current configuration for this request.
+        let current = self.engine.load();
+        let engine = &*current;
+        ctx.started = std::time::Instant::now();
+        let request = session.req_header().clone();
+        session.as_downstream_mut().enable_retry_buffering();
+        ctx.request = request.clone();
+        let host = request
+            .headers
+            .get(http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| request.uri.authority().map(|authority| authority.as_str()))
+            .unwrap_or_default()
+            .to_string();
+        ctx.host = host.clone();
+        let mut state = RequestState::new(
+            connection_state(session, &ctx.listen),
+            RequestLine::from_header(&request),
+            request.headers.clone(),
+            engine.providers,
+        );
+        ctx.client = state.client.clone();
+        {
+            use crate::modules::stub_status::{ServerStats, StatsSnapshot};
+            ServerStats::inc(&engine.stats.accepted);
+            ServerStats::inc(&engine.stats.requests);
+            ServerStats::inc(&engine.stats.handled);
+            ServerStats::inc(&engine.stats.active);
+            state.insert(StatsSnapshot::from_stats(&engine.stats));
         }
-    }
 
-    /// Mark this listener as TLS and install the handshake configuration.
-    pub fn with_tls(mut self, tls: ListenerTls) -> Self {
-        self.tls = Some(Arc::new(tls));
-        self
-    }
+        // `return` (rewrite module) records the action here; PREACCESS/ACCESS handlers
+        // still run before the response is generated, matching the C phase engine.
+        let mut pending_return: Option<crate::modules::rewrite::ReturnAction> = None;
 
-    pub fn tls(&self) -> Option<&Arc<ListenerTls>> {
-        self.tls.as_ref()
-    }
-}
+        for _ in 0..10 {
+            let Some(server) = engine.select_server(&ctx.listen, &state.request.host) else {
+                return self.respond(
+                    &mut state,
+                    session,
+                    ctx,
+                    StatusCode::NOT_FOUND,
+                    "404 Not Found\n",
+                    &[],
+                )
+                .await;
+            };
+            let Some(location) = engine.select_location(server, &state.request.path) else {
+                return self.respond(
+                    &mut state,
+                    session,
+                    ctx,
+                    StatusCode::NOT_FOUND,
+                    "404 Not Found\n",
+                    &[],
+                )
+                .await;
+            };
+            let selected = Selected { server, location };
+            let compiled = engine.location(selected).expect("selected location exists");
+            state.server_name = engine.servers[server]
+                .server_names
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            ctx.server_name = state.server_name.clone();
+            ctx.selected = Some(selected);
 
-#[async_trait]
-impl pingora_core::apps::ServerApp for crate::core::bridge::Bridge {
-    /// Accept one downstream connection.
-    async fn process_new(
-        self: &Arc<Self>,
-        stream: pingora_core::protocols::Stream,
-        shutdown: &ShutdownWatch,
-    ) -> Option<pingora_core::protocols::Stream> {
-        let _ = shutdown;
-        let stream: pingora_core::protocols::Stream = match self.tls() {
-            None => stream,
-            Some(listener_tls) => {
-                match crate::core::tls::accept(stream, listener_tls, TLS_HANDSHAKE_TIMEOUT).await {
-                    Ok(tls_stream) => Box::new(tls_stream),
-                    Err(error) => {
-                        log::info!("TLS handshake with {} failed: {error:#}", self.listen);
-                        return None;
+            // `NGX_HTTP_POST_READ_PHASE`: realip before anything observes `$remote_addr`.
+            engine.apply_realip(compiled, &mut state);
+            ctx.client = state.client.clone();
+
+            // `NGX_HTTP_REWRITE_PHASE`.
+            if let Some(conf) = compiled.conf.get::<RewriteConf>().cloned() {
+                let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
+                    session,
+                    &mut state,
+                    &compiled.conf,
+                    &ctx.server_name,
+                );
+                if let Some(outcome) =
+                    rewrite::apply_rewrites(&mut module_ctx, &conf).map_err(engine_error)?
+                {
+                    match outcome {
+                        rewrite::RewriteOutcome::Redirect { status, target } => {
+                            let status = StatusCode::from_u16(status).map_err(engine_error)?;
+                            let location_header = vec![("Location".to_string(), target)];
+                            return self.respond(
+                                &mut state,
+                                session,
+                                ctx,
+                                status,
+                                "",
+                                &location_header,
+                            )
+                            .await;
+                        }
+                        rewrite::RewriteOutcome::Internal { target, restart } => {
+                            let (path, args) = uri::split_target(&target);
+                            state.request.path = path;
+                            if let Some(args) = args {
+                                state.request.args = args;
+                            }
+                            if restart {
+                                continue;
+                            }
+                            let Some(new_location) =
+                                engine.select_location(server, &state.request.path)
+                            else {
+                                return self.respond(
+                                    &mut state,
+                                    session,
+                                    ctx,
+                                    StatusCode::NOT_FOUND,
+                                    "404 Not Found\n",
+                                    &[],
+                                )
+                                .await;
+                            };
+                            return self
+                                .content_phase(
+                                    session,
+                                    &mut state,
+                                    ctx,
+                                    Selected {
+                                        server,
+                                        location: new_location,
+                                    },
+                                )
+                                .await;
+                        }
                     }
                 }
+                if let Some(action) = rewrite::return_spec(&conf) {
+                    // Keep the unevaluated action: Nginx evaluates the text in the content
+                    // phase, after PREACCESS handlers such as `limit_req` ran, so
+                    // `$limit_req_status` observes its final value.
+                    pending_return = Some(action);
+                }
             }
-        };
-        let _ = &stream;
-        // The proxy layer dispatches the HTTP session types itself.
-        let prox = Arc::new(pingora_proxy::HttpProxy::new(self.clone(), self.server_options()));
-        pingora_core::apps::ServerApp::process_new(&prox, stream, shutdown).await
+            // limit_req, then access control, matching Nginx's phase handlers.
+            let conn_denied = {
+                let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
+                    session,
+                    &mut state,
+                    &compiled.conf,
+                    &ctx.server_name,
+                );
+                crate::modules::limit_conn::handle(&mut module_ctx)
+                    .await
+                    .map_err(engine_error)?
+            };
+            ctx.connections = state.take::<crate::modules::limit_conn::HeldConnections>();
+            if let Some(status) = conn_denied {
+                let status = StatusCode::from_u16(status).map_err(engine_error)?;
+                return self.respond(
+                    &mut state,
+                    session,
+                    ctx,
+                    status,
+                    "503 Service Temporarily Unavailable\n",
+                    &[],
+                )
+                .await;
+            }
+
+            // `NGX_HTTP_PREACCESS_PHASE`: limit_req runs before access control, as in
+            // Nginx's phase order, so rate-limited clients never reach auth checks.
+            if let Some((status, wait)) = {
+                let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
+                    session,
+                    &mut state,
+                    &compiled.conf,
+                    &ctx.server_name,
+                );
+                crate::modules::limit_req::handle(&mut module_ctx)
+                    .await
+                    .map_err(engine_error)?
+            } {
+                if status == 0 {
+                    if let Some(wait) = wait {
+                        tokio::time::sleep(wait).await;
+                    }
+                } else {
+                    let status = StatusCode::from_u16(status).map_err(engine_error)?;
+                    return self.respond(
+                        &mut state,
+                        session,
+                        ctx,
+                        status,
+                        &format!(
+                            "{} {}\n",
+                            status.as_u16(),
+                            status.canonical_reason().unwrap_or("Limited")
+                        ),
+                        &[],
+                    )
+                    .await;
+                }
+            }
+            let denied = {
+                let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
+                    session,
+                    &mut state,
+                    &compiled.conf,
+                    &ctx.server_name,
+                );
+                crate::modules::access::handle(&mut module_ctx)
+                    .await
+                    .map_err(engine_error)?
+            };
+            if let Some(status) = denied {
+                let status = StatusCode::from_u16(status).map_err(engine_error)?;
+                return self.respond(
+                    &mut state,
+                    session,
+                    ctx,
+                    status,
+                    "403 Forbidden\n",
+                    &[],
+                )
+                .await;
+            }
+
+            // `NGX_HTTP_ACCESS_PHASE` for `access_by_lua`.
+            if let Some(hook) = compiled
+                .conf
+                .get::<LuaConf>()
+                .and_then(|conf| conf.access.as_ref())
+            {
+                let outcome = lua::execute(hook, &state).map_err(engine_error)?;
+                if !outcome.request_headers.is_empty() {
+                    lua::apply_request_headers(&mut state.headers, &outcome.request_headers)
+                        .map_err(engine_error)?;
+                }
+                if let Some(target) = &outcome.uri
+                    && target != &state.request.path
+                {
+                    state.request.path = target.clone();
+                    continue;
+                }
+                if outcome.exited || !outcome.body.is_empty() {
+                    let status = StatusCode::from_u16(outcome.status.unwrap_or(200))
+                        .map_err(engine_error)?;
+                    return self.respond(
+                        &mut state,
+                        session,
+                        ctx,
+                        status,
+                        &outcome.body,
+                        &outcome.headers,
+                    )
+                    .await;
+                }
+            }
+            // `return` recorded an action during the rewrite phase; access and limits have
+            // now had their say, so evaluate and emit it instead of running a content
+            // handler.
+            if let Some(action) = pending_return.take() {
+                let action = rewrite::evaluate_return(&action, &state);
+                let status = StatusCode::from_u16(action.status).map_err(engine_error)?;
+                let headers = action
+                    .target
+                    .clone()
+                    .filter(|_| status.is_redirection())
+                    .map(|target| vec![("Location".to_string(), target)])
+                    .unwrap_or_default();
+                let body = if status.is_redirection() {
+                    String::new()
+                } else {
+                    action.target.unwrap_or_default()
+                };
+                return self.respond(
+                    &mut state,
+                    session,
+                    ctx,
+                    status,
+                    &body,
+                    &headers,
+                )
+                .await;
+            }
+            return self
+                .content_phase(session, &mut state, ctx, selected)
+                .await;
+        }
+        self.respond(
+            &mut state,
+            session,
+            ctx,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "500 Rewrite or internal redirection cycle\n",
+            &[],
+        )
+        .await
     }
 }
-
-impl HttpCoreApp {
-    /// The listener address this service is bound to.
-    pub fn listen(&self) -> &str {
-        &self.listen
-    }
-
-    /// HTTP server options handed to Pingora's `HttpProxy`.
-    fn server_options(&self) -> Arc<pingora_core::server::configuration::ServerConf> {
-        self.engine.load().server_conf.clone()
-    }
-}
-
-/// `ssl_handshake_timeout` default in Nginx.
-const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Engine {
     pub fn new(
@@ -275,6 +532,8 @@ impl Engine {
         self.listeners.keys().map(String::as_str)
     }
 
+    /// `ngx_http_find_virtual_server`: pick the server by `Host`/SNI, then the
+    /// `default_server` of the address.
     pub fn select_server(&self, listen: &str, host: &str) -> Option<usize> {
         let hosts = self.listeners.get(listen)?;
         let host = normalize_host(host);
@@ -330,6 +589,101 @@ impl Engine {
     }
 }
 
+impl HttpCoreApp {
+    /// Produce a complete response for one request and report the phase outcome.
+    async fn respond(
+        &self,
+        state: &mut RequestState,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        status: StatusCode,
+        body: &str,
+        headers: &[(String, String)],
+    ) -> Result<PhaseOutcome> {
+        let _ = self.answer(session, state, ctx, status, body, headers).await;
+        Ok(PhaseOutcome::Answered)
+    }
+}
+
+impl HttpCoreApp {
+    pub fn new(engine: Arc<ArcSwap<Engine>>, listen: String) -> Self {
+        Self {
+            engine,
+            listen,
+            tls: None,
+        }
+    }
+
+    /// Mark this listener as TLS and install the handshake configuration.
+    pub fn with_tls(mut self, tls: ListenerTls) -> Self {
+        self.tls = Some(Arc::new(tls));
+        self
+    }
+
+    /// Install (or remove) the TLS handshake settings of this listener.
+    pub fn apply_tls(&mut self, tls: Option<ListenerTls>) {
+        self.tls = tls.map(Arc::new);
+    }
+
+    /// The TLS handshake settings of this listener, when `listen ... ssl` applies.
+    pub fn tls(&self) -> Option<&Arc<ListenerTls>> {
+        self.tls.as_ref()
+    }
+
+    /// The listener address this service is bound to.
+    pub fn listen(&self) -> &str {
+        &self.listen
+    }
+
+    /// `new_ctx()` for a session served by [`Bridge`].
+    pub fn new_request_context(&self) -> RequestContext {
+        RequestContext {
+            listen: self.listen.clone(),
+            request: RequestHeader::build("GET", b"/", Some(0))
+                .expect("placeholder request is valid"),
+            selected: None,
+            proxying: None,
+            backend: None,
+            client: crate::core::http::ClientState::default(),
+            connections: None,
+            host: String::new(),
+            server_name: String::new(),
+            started: std::time::Instant::now(),
+            ssl: None,
+            ssl_server: None,
+        }
+    }
+
+    /// `ngx_http_log_request`: emit the access log entry for a finished request.
+    pub async fn log_request(
+        &self,
+        session: &mut Session,
+        ctx: &RequestContext,
+        error: Option<&Error>,
+    ) {
+        let current = self.engine.load();
+        let engine = &*current;
+        let status = session
+            .response_written()
+            .map_or(0, |response| response.status.as_u16());
+        let view = self.view(ctx);
+        let mut state = view_as_state(&view, engine.providers);
+        state.body_bytes_sent = session.body_bytes_sent();
+        state.status = session.response_written().map(|response| response.status);
+        let message = error.map(|error| error.to_string());
+        engine.access_log.log(
+            engine.access_writer.as_deref(),
+            &state,
+            status,
+            message.as_deref(),
+        );
+    }
+
+    /// HTTP server options handed to Pingora's proxy layer.
+    fn server_options(&self) -> Arc<pingora_core::server::configuration::ServerConf> {
+        self.engine.load().server_conf.clone()
+    }
+}
 
 #[async_trait]
 impl ProxyHttp for HttpCoreApp {
@@ -348,298 +702,16 @@ impl ProxyHttp for HttpCoreApp {
             host: String::new(),
             server_name: String::new(),
             started: std::time::Instant::now(),
+            ssl: None,
+            ssl_server: None,
         }
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        // Snapshot the current configuration for this request.
-        let current = self.engine.load();
-        let engine = &*current;
-        ctx.started = std::time::Instant::now();
-        let request = session.req_header().clone();
-        session.as_downstream_mut().enable_retry_buffering();
-        ctx.request = request.clone();
-        let host = request
-            .headers
-            .get(http::header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .or_else(|| request.uri.authority().map(|authority| authority.as_str()))
-            .unwrap_or_default()
-            .to_string();
-        ctx.host = host.clone();
-        let mut state = RequestState::new(
-            connection_state(session, &ctx.listen),
-            RequestLine::from_header(&request),
-            request.headers.clone(),
-            engine.providers,
-        );
-        ctx.client = state.client.clone();
-        {
-            use crate::modules::stub_status::{ServerStats, StatsSnapshot};
-            ServerStats::inc(&engine.stats.accepted);
-            ServerStats::inc(&engine.stats.requests);
-            ServerStats::inc(&engine.stats.handled);
-            ServerStats::inc(&engine.stats.active);
-            state.insert(StatsSnapshot::from_stats(&engine.stats));
+        match self.route_request(session, ctx).await? {
+            PhaseOutcome::Answered => Ok(true),
+            PhaseOutcome::Proxy => Ok(false),
         }
-
-        // `return` (rewrite module) records the action here; PREACCESS/ACCESS handlers
-        // still run before the response is generated, matching the C phase engine.
-        let mut pending_return: Option<crate::modules::rewrite::ReturnAction> = None;
-
-        for _ in 0..10 {
-            let Some(server) = engine.select_server(&ctx.listen, &state.request.host) else {
-                return Ok(self
-                    .answer(
-                        session,
-                        &mut state,
-                        ctx,
-                        StatusCode::NOT_FOUND,
-                        "404 Not Found\n",
-                        &[],
-                    )
-                    .await);
-            };
-            let Some(location) = engine.select_location(server, &state.request.path) else {
-                return Ok(self
-                    .answer(
-                        session,
-                        &mut state,
-                        ctx,
-                        StatusCode::NOT_FOUND,
-                        "404 Not Found\n",
-                        &[],
-                    )
-                    .await);
-            };
-            let selected = Selected { server, location };
-            let compiled = engine.location(selected).expect("selected location exists");
-            state.server_name = engine.servers[server]
-                .server_names
-                .first()
-                .cloned()
-                .unwrap_or_default();
-            ctx.server_name = state.server_name.clone();
-            ctx.selected = Some(selected);
-
-            // `NGX_HTTP_POST_READ_PHASE`: realip before anything observes `$remote_addr`.
-            engine.apply_realip(compiled, &mut state);
-            ctx.client = state.client.clone();
-
-            // `NGX_HTTP_REWRITE_PHASE`.
-            if let Some(conf) = compiled.conf.get::<RewriteConf>().cloned() {
-                let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
-                    session,
-                    &mut state,
-                    &compiled.conf,
-                    &ctx.server_name,
-                );
-                if let Some(outcome) =
-                    rewrite::apply_rewrites(&mut module_ctx, &conf).map_err(engine_error)?
-                {
-                    match outcome {
-                        rewrite::RewriteOutcome::Redirect { status, target } => {
-                            let status = StatusCode::from_u16(status).map_err(engine_error)?;
-                            let location_header = vec![("Location".to_string(), target)];
-                            return Ok(self
-                                .answer(session, &mut state, ctx, status, "", &location_header)
-                                .await);
-                        }
-                        rewrite::RewriteOutcome::Internal { target, restart } => {
-                            let (path, args) = uri::split_target(&target);
-                            state.request.path = path;
-                            if let Some(args) = args {
-                                state.request.args = args;
-                            }
-                            if restart {
-                                continue;
-                            }
-                            let Some(new_location) =
-                                engine.select_location(server, &state.request.path)
-                            else {
-                                return Ok(self
-                                    .answer(
-                                        session,
-                                        &mut state,
-                                        ctx,
-                                        StatusCode::NOT_FOUND,
-                                        "404 Not Found\n",
-                                        &[],
-                                    )
-                                    .await);
-                            };
-                            return self
-                                .content_phase(
-                                    session,
-                                    &mut state,
-                                    ctx,
-                                    Selected {
-                                        server,
-                                        location: new_location,
-                                    },
-                                )
-                                .await;
-                        }
-                    }
-                }
-                if let Some(action) = rewrite::return_spec(&conf) {
-                    // Keep the unevaluated action: Nginx evaluates the text in the content
-                    // phase, after PREACCESS handlers such as `limit_req` ran, so
-                    // `$limit_req_status` observes its final value.
-                    pending_return = Some(action);
-                }
-            }
-
-            // `NGX_HTTP_PREACCESS_PHASE`: limit_conn first (connection accounting), then
-            // limit_req, then access control, matching Nginx's phase handlers.
-            let conn_denied = {
-                let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
-                    session,
-                    &mut state,
-                    &compiled.conf,
-                    &ctx.server_name,
-                );
-                crate::modules::limit_conn::handle(&mut module_ctx)
-                    .await
-                    .map_err(engine_error)?
-            };
-            ctx.connections = state.take::<crate::modules::limit_conn::HeldConnections>();
-            if let Some(status) = conn_denied {
-                let status = StatusCode::from_u16(status).map_err(engine_error)?;
-                return Ok(self
-                    .answer(
-                        session,
-                        &mut state,
-                        ctx,
-                        status,
-                        "503 Service Temporarily Unavailable\n",
-                        &[],
-                    )
-                    .await);
-            }
-
-            // `NGX_HTTP_PREACCESS_PHASE`: limit_req runs before access control, as in
-            // Nginx's phase order, so rate-limited clients never reach auth checks.
-            if let Some((status, wait)) = {
-                let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
-                    session,
-                    &mut state,
-                    &compiled.conf,
-                    &ctx.server_name,
-                );
-                crate::modules::limit_req::handle(&mut module_ctx)
-                    .await
-                    .map_err(engine_error)?
-            } {
-                if status == 0 {
-                    if let Some(wait) = wait {
-                        tokio::time::sleep(wait).await;
-                    }
-                } else {
-                    let status = StatusCode::from_u16(status).map_err(engine_error)?;
-                    return Ok(self
-                        .answer(
-                            session,
-                            &mut state,
-                            ctx,
-                            status,
-                            &format!(
-                                "{} {}\n",
-                                status.as_u16(),
-                                status.canonical_reason().unwrap_or("Limited")
-                            ),
-                            &[],
-                        )
-                        .await);
-                }
-            }
-
-            // `NGX_HTTP_ACCESS_PHASE`: `allow` / `deny` from the access module.
-            let denied = {
-                let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
-                    session,
-                    &mut state,
-                    &compiled.conf,
-                    &ctx.server_name,
-                );
-                crate::modules::access::handle(&mut module_ctx)
-                    .await
-                    .map_err(engine_error)?
-            };
-            if let Some(status) = denied {
-                let status = StatusCode::from_u16(status).map_err(engine_error)?;
-                return Ok(self
-                    .answer(session, &mut state, ctx, status, "403 Forbidden\n", &[])
-                    .await);
-            }
-
-            // `NGX_HTTP_ACCESS_PHASE` for `access_by_lua`.
-            if let Some(hook) = compiled
-                .conf
-                .get::<LuaConf>()
-                .and_then(|conf| conf.access.as_ref())
-            {
-                let outcome = lua::execute(hook, &state).map_err(engine_error)?;
-                if !outcome.request_headers.is_empty() {
-                    lua::apply_request_headers(&mut state.headers, &outcome.request_headers)
-                        .map_err(engine_error)?;
-                }
-                if let Some(target) = &outcome.uri
-                    && target != &state.request.path
-                {
-                    state.request.path = target.clone();
-                    continue;
-                }
-                if outcome.exited || !outcome.body.is_empty() {
-                    let status = StatusCode::from_u16(outcome.status.unwrap_or(200))
-                        .map_err(engine_error)?;
-                    return Ok(self
-                        .answer(
-                            session,
-                            &mut state,
-                            ctx,
-                            status,
-                            &outcome.body,
-                            &outcome.headers,
-                        )
-                        .await);
-                }
-            }
-
-            // `return` recorded an action during the rewrite phase; access and limits have
-            // now had their say, so evaluate and emit it instead of running a content
-            // handler.
-            if let Some(action) = pending_return.take() {
-                let action = rewrite::evaluate_return(&action, &state);
-                let status = StatusCode::from_u16(action.status).map_err(engine_error)?;
-                let headers = action
-                    .target
-                    .clone()
-                    .filter(|_| status.is_redirection())
-                    .map(|target| vec![("Location".to_string(), target)])
-                    .unwrap_or_default();
-                let body = if status.is_redirection() {
-                    String::new()
-                } else {
-                    action.target.unwrap_or_default()
-                };
-                return Ok(self
-                    .answer(session, &mut state, ctx, status, &body, &headers)
-                    .await);
-            }
-
-            return self.content_phase(session, &mut state, ctx, selected).await;
-        }
-        Ok(self
-            .answer(
-                session,
-                &mut state,
-                ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "500 Rewrite or internal redirection cycle\n",
-                &[],
-            )
-            .await)
     }
 
     async fn upstream_peer(
@@ -834,24 +906,20 @@ impl HttpCoreApp {
         state: &mut RequestState,
         ctx: &mut RequestContext,
         selected: Selected,
-    ) -> Result<bool> {
+    ) -> Result<PhaseOutcome> {
         let current = self.engine.load();
         let engine = &*current;
         let Some(compiled) = engine.location(selected) else {
-            return Ok(self
-                .answer(
-                    session,
-                    state,
-                    ctx,
-                    StatusCode::NOT_FOUND,
-                    "404 Not Found\n",
-                    &[],
-                )
-                .await);
+            return self.respond(
+                state,
+                session,
+                ctx,
+                StatusCode::NOT_FOUND,
+                "404 Not Found\n",
+                &[],
+            )
+            .await;
         };
-        ctx.selected = Some(selected);
-        ctx.proxying = None;
-
         // `stub_status` and `prometheus_metrics` answer directly from the counters.
         if let Some(format) = compiled
             .conf
@@ -888,7 +956,7 @@ impl HttpCoreApp {
                     .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
             }
-            return Ok(true);
+            return Ok(PhaseOutcome::Answered);
         }
 
         if let Some(hook) = compiled
@@ -899,13 +967,21 @@ impl HttpCoreApp {
             let outcome = lua::execute(hook, state).map_err(engine_error)?;
             let status =
                 StatusCode::from_u16(outcome.status.unwrap_or(200)).map_err(engine_error)?;
-            return Ok(self
-                .answer(session, state, ctx, status, &outcome.body, &outcome.headers)
-                .await);
+            return self.respond(
+                state,
+                session,
+                ctx,
+                status,
+                &outcome.body,
+                &outcome.headers,
+            )
+            .await;
         }
+
+
         if engine.upstream_for(compiled).is_some() {
             ctx.proxying = Some(selected);
-            return Ok(false);
+            return Ok(PhaseOutcome::Proxy);
         }
         if compiled
             .conf
@@ -919,20 +995,20 @@ impl HttpCoreApp {
                 &ctx.server_name,
             );
             if static_files::handle(&mut module_ctx).await? {
-                return Ok(true);
+                return Ok(PhaseOutcome::Answered);
             }
         }
-        Ok(self
-            .answer(
-                session,
-                state,
-                ctx,
-                StatusCode::NOT_FOUND,
-                "404 Not Found\n",
-                &[],
-            )
-            .await)
+        self.respond(
+            state,
+            session,
+            ctx,
+            StatusCode::NOT_FOUND,
+            "404 Not Found\n",
+            &[],
+        )
+        .await
     }
+
 
     /// Write a locally generated response after running the header filter chain.
     async fn answer(

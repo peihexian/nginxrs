@@ -6,7 +6,7 @@ use nginxrs::core::reload::{self, Reloader};
 use nginxrs::modules::balancer::Upstream;
 use nginxrs::modules::log::{AccessLogConfig, AccessLogWriter, LogTarget};
 use nginxrs::modules::stub_status::ServerStats;
-use nginxrs::modules::{PROVIDERS, upstream};
+use nginxrs::modules::{PROVIDERS, ssl, upstream};
 use pingora_core::server::Server;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::services::ServiceWithDependents;
@@ -157,47 +157,43 @@ fn main() -> Result<()> {
     let mut server = Server::new_with_opt_and_conf(None, server_conf);
     server.bootstrap();
     server.add_services(services);
-    let tls_listeners: Vec<String> = config
+
+    // TLS listeners: every `server {}` with `listen ... ssl` shares one virtual-host table
+    // per address, with the certificates resolved by SNI at handshake time.
+    let tls = config
         .module_states
-        .get::<nginxrs::modules::ssl::TlsServers>(nginxrs::modules::ssl::MODULE_NAME)
-        .map(|tls| tls.enabled_listeners().to_vec())
-        .unwrap_or_default();
+        .get::<nginxrs::modules::ssl::SslModuleState>(nginxrs::modules::ssl::MODULE_NAME);
+    let runtime = match tls {
+        Some(tls) => Some(tls.build_runtime(|index| {
+            config
+                .http
+                .servers
+                .get(index)
+                .is_some_and(|server| server.http2)
+        })?),
+        None => None,
+    };
+    let stats = Arc::new(nginxrs::core::http_core::TlsStats::default());
     for listen in listeners {
-        let service = HttpCoreApp::new(Arc::clone(&engine), listen.clone());
-        let mut service = pingora_proxy::http_proxy_service(&server.configuration, service);
-        match config
-            .module_states
-            .get::<nginxrs::modules::ssl::TlsServers>(nginxrs::modules::ssl::MODULE_NAME)
-            .and_then(|tls| tls.for_server(&listen))
-        {
-            Some(tls) if tls_listeners.contains(&listen) => {
-                let certificate = tls
-                    .certificate
-                    .as_ref()
-                    .context("TLS listener without a certificate")?;
-                let key = tls
-                    .certificate_key
-                    .as_ref()
-                    .context("TLS listener without a private key")?;
-                let mut settings = pingora_core::listeners::tls::TlsSettings::intermediate(
-                    &certificate.to_string_lossy(),
-                    &key.to_string_lossy(),
-                )
-                .with_context(|| {
-                    format!(
-                        "cannot load the TLS certificate {} / {}",
-                        certificate.display(),
-                        key.display()
-                    )
-                })?;
-                settings.enable_h2();
-                service.add_tls_with_settings(&listen, None, settings);
-                log::info!("nginxrs listening on https://{listen}");
-            }
-            _ => {
-                service.add_tcp(&listen);
-                log::info!("nginxrs listening on http://{listen}");
-            }
+        let mut app = nginxrs::core::http_core::HttpCoreApp::new(Arc::clone(&engine), listen.clone());
+        let hosts = runtime.as_ref().and_then(|runtime| {
+            ssl::virtual_hosts(&config, runtime, &listen).map(|(hosts, buffer)| {
+                nginxrs::core::http_core::ListenerTls {
+                    hosts,
+                    sessions: Arc::new(nginxrs::modules::ssl::sessions::SharedCaches::default()),
+                    buffer_size: buffer,
+                    stats: stats.clone(),
+                }
+            })
+        });
+        app.apply_tls(hosts);
+        let mut service =
+            pingora_proxy::http_proxy_service(&server.configuration, app);
+        service.add_tcp(&listen);
+        if runtime.is_some() && ssl::virtual_hosts(&config, runtime.as_ref().unwrap(), &listen).is_some() {
+            log::info!("nginxrs listening on https://{listen}");
+        } else {
+            log::info!("nginxrs listening on http://{listen}");
         }
         server.add_service(service);
     }
@@ -253,6 +249,7 @@ fn build_engine(
         stats,
         Arc::new(access_config),
         access_writer,
+        Arc::new(ServerConf::default()),
     );
     Ok((engine, services))
 }

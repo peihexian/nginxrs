@@ -135,7 +135,14 @@ pub fn apply_cipher_expression(expression: &str, suites: &[&str]) -> Result<Vec<
                     result.extend(matched);
                 }
             }
-            '!' => result.retain(|name| !matched.contains(name)),
+            // `!` removes from the configured list, or from `ALL` when it is still empty
+            // (OpenSSL starts the list from the default set).
+            '!' => {
+                if result.is_empty() {
+                    result.extend(suites.iter().map(|name| name.to_string()));
+                }
+                result.retain(|name| !matched.contains(name));
+            }
             '-' => {
                 if !result.is_empty() {
                     result.retain(|name| !matched.contains(name));
@@ -176,7 +183,8 @@ impl Keyword {
             "ALL" => Some(Self::All),
             "COMPLEMENTOFALL" => Some(Self::ComplementOfAll),
             "COMPLEMENTOFDEFAULT" => Some(Self::ComplementOfDefault),
-            "HIGH" => Some(Self::High),
+            "HIGH" | "AES" | "AESGCM" | "CHACHA20" | "ECDHE" | "EECDH" | "kECDHE" | "aRSA"
+            | "aECDSA" => Some(Self::High),
             "DEFAULT" => Some(Self::Default),
             "ECDHE" => Some(Self::Ecdhe),
             "AEAD" => Some(Self::Aead),
@@ -271,6 +279,10 @@ pub fn normalize_alias(name: &str) -> String {
         let mut rest = parts.join("_");
         rest = rest.replace("AES128", "AES_128").replace("AES256", "AES_256");
         rest = rest.replace("CHACHA20POLY1305", "CHACHA20_POLY1305");
+        // OpenSSL omits the SHA-256 suffix of ChaCha20-Poly1305 suites.
+        if rest == "CHACHA20_POLY1305" {
+            rest = "CHACHA20_POLY1305_SHA256".to_string();
+        }
         match auth {
             Some(auth) => format!("TLS_{kex}_{auth}_WITH_{rest}"),
             None => format!("TLS_{kex}_WITH_{rest}"),

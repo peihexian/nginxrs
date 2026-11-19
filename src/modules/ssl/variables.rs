@@ -19,7 +19,7 @@ pub struct SslSession {
     pub cipher: Option<String>,
     /// `SSL_SESSION_get_id`.
     pub session_id: Option<Vec<u8>>,
-    /// `SSL_session_reused`.
+    /// `SslSessionReused`.
     pub session_reused: bool,
     /// `SSL_get_servername(SSL_CTRL_GET_SERVER_NAME)`, e.g. the SNI name.
     pub server_name: Option<String>,
@@ -130,32 +130,32 @@ pub fn signature_algorithm(der: &[u8]) -> Option<String> {
 /// Providers registered by [`crate::modules::ssl::SslModule::variables`].
 pub fn providers() -> Vec<(&'static str, &'static dyn VariableProvider)> {
     vec![
-        ("ssl_protocol", &SSL_PROTOCOL),
-        ("ssl_cipher", &SSL_CIPHER),
-        ("ssl_ciphers", &SSL_CIPHERS),
-        ("ssl_curve", &SSL_CURVE),
-        ("ssl_curves", &SSL_CURVES),
-        ("ssl_sigalg", &SSL_SIGALG),
-        ("ssl_sigalgs", &SSL_SIGALGS),
-        ("ssl_session_id", &SSL_SESSION_ID),
-        ("ssl_session_reused", &SSL_SESSION_REUSED),
-        ("ssl_early_data", &SSL_EARLY_DATA),
-        ("ssl_server_name", &SSL_SERVER_NAME),
-        ("ssl_alpn_protocol", &SSL_ALPN_PROTOCOL),
-        ("ssl_client_cert", &SSL_CLIENT_CERT),
-        ("ssl_client_raw_cert", &SSL_CLIENT_RAW_CERT),
-        ("ssl_client_escaped_cert", &SSL_CLIENT_ESCAPED_CERT),
-        ("ssl_client_s_dn", &SSL_CLIENT_S_DN),
-        ("ssl_client_i_dn", &SSL_CLIENT_I_DN),
-        ("ssl_client_s_dn_legacy", &SSL_CLIENT_S_DN_LEGACY),
-        ("ssl_client_i_dn_legacy", &SSL_CLIENT_I_DN_LEGACY),
-        ("ssl_client_serial", &SSL_CLIENT_SERIAL),
-        ("ssl_client_fingerprint", &SSL_CLIENT_FINGERPRINT),
-        ("ssl_client_verify", &SSL_CLIENT_VERIFY),
-        ("ssl_client_v_start", &SSL_CLIENT_V_START),
-        ("ssl_client_v_end", &SSL_CLIENT_V_END),
-        ("ssl_client_v_remain", &SSL_CLIENT_V_REMAIN),
-        ("ssl_client_sigalg", &SSL_CLIENT_SIGALG),
+        ("SslProtocol", &SslProtocol),
+        ("SslCipher", &SslCipher),
+        ("SslCiphers", &SslCiphers),
+        ("SslCurve", &SslCurve),
+        ("SslCurves", &SslCurves),
+        ("SslSigalg", &SslSigalg),
+        ("SslSigalgs", &SslSigalgs),
+        ("SslSessionId", &SslSessionId),
+        ("SslSessionReused", &SslSessionReused),
+        ("SslEarlyData", &SslEarlyData),
+        ("SslServerName", &SslServerName),
+        ("SslAlpnProtocol", &SslAlpnProtocol),
+        ("SslClientCert", &SslClientCert),
+        ("SslClientRawCert", &SslClientRawCert),
+        ("SslClientEscapedCert", &SslClientEscapedCert),
+        ("SslClientSubjectDn", &SslClientSubjectDn),
+        ("SslClientIssuerDn", &SslClientIssuerDn),
+        ("SslClientSubjectDnLegacy", &SslClientSubjectDnLegacy),
+        ("SslClientIssuerDnLegacy", &SslClientIssuerDnLegacy),
+        ("SslClientSerial", &SslClientSerial),
+        ("SslClientFingerprint", &SslClientFingerprint),
+        ("SslClientVerify", &SslClientVerify),
+        ("SslClientValidStart", &SslClientValidStart),
+        ("SslClientValidEnd", &SslClientValidEnd),
+        ("SslClientValidRemain", &SslClientValidRemain),
+        ("SslClientSigalg", &SslClientSigalg),
     ]
 }
 
@@ -178,15 +178,15 @@ macro_rules! simple_provider {
     };
 }
 
-simple_provider!(SSL_PROTOCOL, protocol);
-simple_provider!(SSL_CIPHER, cipher);
-simple_provider!(SSL_SERVER_NAME, server_name);
-simple_provider!(SSL_ALPN_PROTOCOL, alpn_protocol);
+simple_provider!(SslProtocolName, protocol);
+simple_provider!(SslCipher, cipher);
+simple_provider!(SslServerName, server_name);
+simple_provider!(SslAlpnProtocol, alpn_protocol);
 
-/// `$ssl_ciphers`: the client's cipher list from `SSL_get_client_ciphers`.
+/// `$SslCiphers`: the client's cipher list from `SSL_get_client_ciphers`.
 #[derive(Debug)]
-pub struct SSL_CIPHERS;
-impl VariableProvider for SSL_CIPHERS {
+pub struct SslCiphers;
+impl VariableProvider for SslCiphers {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -195,10 +195,10 @@ impl VariableProvider for SSL_CIPHERS {
     }
 }
 
-/// `$ssl_curves`: the client's elliptic curve list.
+/// `$SslCurves`: the client's elliptic curve list.
 #[derive(Debug)]
-pub struct SSL_CURVES;
-impl VariableProvider for SSL_CURVES {
+pub struct SslCurves;
+impl VariableProvider for SslCurves {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -207,10 +207,10 @@ impl VariableProvider for SSL_CURVES {
     }
 }
 
-/// `$ssl_curve`: the curve used for ECDHE (`SSL_get_negotiated_group`).
+/// `$SslCurve`: the curve used for ECDHE (`SSL_get_negotiated_group`).
 #[derive(Debug)]
-pub struct SSL_CURVE;
-impl VariableProvider for SSL_CURVE {
+pub struct SslCurve;
+impl VariableProvider for SslCurve {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -234,12 +234,12 @@ macro_rules! sigalg_static {
     };
 }
 
-sigalg_static!(SSL_SIGALG, "ECDSA+SHA256");
-sigalg_static!(SSL_SIGALGS, "ECDSA+SHA256:ECDSA+SHA384:ed25519");
+sigalg_static!(SslSigalg, "ECDSA+SHA256");
+sigalg_static!(SslSigalgs, "ECDSA+SHA256:ECDSA+SHA384:ed25519");
 
 #[derive(Debug)]
-pub struct SSL_SESSION_ID;
-impl VariableProvider for SSL_SESSION_ID {
+pub struct SslSessionId;
+impl VariableProvider for SslSessionId {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -250,8 +250,8 @@ impl VariableProvider for SSL_SESSION_ID {
 }
 
 #[derive(Debug)]
-pub struct SSL_SESSION_REUSED;
-impl VariableProvider for SSL_SESSION_REUSED {
+pub struct SslSessionReused;
+impl VariableProvider for SslSessionReused {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -261,8 +261,8 @@ impl VariableProvider for SSL_SESSION_REUSED {
 }
 
 #[derive(Debug)]
-pub struct SSL_EARLY_DATA;
-impl VariableProvider for SSL_EARLY_DATA {
+pub struct SslEarlyData;
+impl VariableProvider for SslEarlyData {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -272,8 +272,8 @@ impl VariableProvider for SSL_EARLY_DATA {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_VERIFY;
-impl VariableProvider for SSL_CLIENT_VERIFY {
+pub struct SslClientVerify;
+impl VariableProvider for SslClientVerify {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -282,11 +282,11 @@ impl VariableProvider for SSL_CLIENT_VERIFY {
     }
 }
 
-/// `$ssl_client_cert`: the client certificate in PEM with leading whitespace on every
+/// `$SslClientCert`: the client certificate in PEM with leading whitespace on every
 /// line, exactly as `BIO_dump_indent`-free `PEM_write_bio_X509` output shifted by Nginx.
 #[derive(Debug)]
-pub struct SSL_CLIENT_CERT;
-impl VariableProvider for SSL_CLIENT_CERT {
+pub struct SslClientCert;
+impl VariableProvider for SslClientCert {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -297,8 +297,8 @@ impl VariableProvider for SSL_CLIENT_CERT {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_RAW_CERT;
-impl VariableProvider for SSL_CLIENT_RAW_CERT {
+pub struct SslClientRawCert;
+impl VariableProvider for SslClientRawCert {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -308,10 +308,10 @@ impl VariableProvider for SSL_CLIENT_RAW_CERT {
     }
 }
 
-/// `$ssl_client_escaped_cert`: `ngx_escape_uri(..., NGX_ESCAPE_URI_COMPONENT)`.
+/// `$SslClientEscapedCert`: `ngx_escape_uri(..., NGX_ESCAPE_URI_COMPONENT)`.
 #[derive(Debug)]
-pub struct SSL_CLIENT_ESCAPED_CERT;
-impl VariableProvider for SSL_CLIENT_ESCAPED_CERT {
+pub struct SslClientEscapedCert;
+impl VariableProvider for SslClientEscapedCert {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -328,8 +328,8 @@ impl VariableProvider for SSL_CLIENT_ESCAPED_CERT {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_S_DN;
-impl VariableProvider for SSL_CLIENT_S_DN {
+pub struct SslClientSubjectDn;
+impl VariableProvider for SslClientSubjectDn {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -340,8 +340,8 @@ impl VariableProvider for SSL_CLIENT_S_DN {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_I_DN;
-impl VariableProvider for SSL_CLIENT_I_DN {
+pub struct SslClientIssuerDn;
+impl VariableProvider for SslClientIssuerDn {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -352,8 +352,8 @@ impl VariableProvider for SSL_CLIENT_I_DN {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_S_DN_LEGACY;
-impl VariableProvider for SSL_CLIENT_S_DN_LEGACY {
+pub struct SslClientSubjectDnLegacy;
+impl VariableProvider for SslClientSubjectDnLegacy {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -364,8 +364,8 @@ impl VariableProvider for SSL_CLIENT_S_DN_LEGACY {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_I_DN_LEGACY;
-impl VariableProvider for SSL_CLIENT_I_DN_LEGACY {
+pub struct SslClientIssuerDnLegacy;
+impl VariableProvider for SslClientIssuerDnLegacy {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -376,8 +376,8 @@ impl VariableProvider for SSL_CLIENT_I_DN_LEGACY {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_SERIAL;
-impl VariableProvider for SSL_CLIENT_SERIAL {
+pub struct SslClientSerial;
+impl VariableProvider for SslClientSerial {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -388,8 +388,8 @@ impl VariableProvider for SSL_CLIENT_SERIAL {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_FINGERPRINT;
-impl VariableProvider for SSL_CLIENT_FINGERPRINT {
+pub struct SslClientFingerprint;
+impl VariableProvider for SslClientFingerprint {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -400,8 +400,8 @@ impl VariableProvider for SSL_CLIENT_FINGERPRINT {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_V_START;
-impl VariableProvider for SSL_CLIENT_V_START {
+pub struct SslClientValidStart;
+impl VariableProvider for SslClientValidStart {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -412,8 +412,8 @@ impl VariableProvider for SSL_CLIENT_V_START {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_V_END;
-impl VariableProvider for SSL_CLIENT_V_END {
+pub struct SslClientValidEnd;
+impl VariableProvider for SslClientValidEnd {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -423,10 +423,10 @@ impl VariableProvider for SSL_CLIENT_V_END {
     }
 }
 
-/// `$ssl_client_v_remain`: whole days until `notAfter`.
+/// `$SslClientValidRemain`: whole days until `notAfter`.
 #[derive(Debug)]
-pub struct SSL_CLIENT_V_REMAIN;
-impl VariableProvider for SSL_CLIENT_V_REMAIN {
+pub struct SslClientValidRemain;
+impl VariableProvider for SslClientValidRemain {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -443,8 +443,8 @@ impl VariableProvider for SSL_CLIENT_V_REMAIN {
 }
 
 #[derive(Debug)]
-pub struct SSL_CLIENT_SIGALG;
-impl VariableProvider for SSL_CLIENT_SIGALG {
+pub struct SslClientSigalg;
+impl VariableProvider for SslClientSigalg {
     fn module(&self) -> &'static str {
         crate::modules::ssl::MODULE_NAME
     }
@@ -466,7 +466,7 @@ pub fn pem(label: &str, der: &[u8]) -> String {
     output
 }
 
-/// Nginx indents every line of `$ssl_client_cert` by one space except the first.
+/// Nginx indents every line of `$SslClientCert` by one space except the first.
 fn indent_pem(pem: String) -> String {
     let mut output = String::with_capacity(pem.len() + pem.lines().count());
     for (index, line) in pem.lines().enumerate() {
