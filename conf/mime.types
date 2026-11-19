@@ -1,0 +1,24 @@
+types {
+    text/html html htm;
+    text/css css;
+    text/plain txt log;
+    application/json json map;
+    application/javascript js mjs;
+    application/xml xml;
+    image/png png;
+    image/jpeg jpg jpeg;
+    image/gif gif;
+    image/svg+xml svg;
+    image/webp webp;
+    application/wasm wasm;
+    application/pdf pdf;
+    application/vnd.apple.mpegurl m3u8;
+    application/dash+xml mpd;
+    video/mp2t ts;
+    video/mp4 mp4 m4v;
+    video/iso.segment m4s;
+    audio/aac aac;
+    audio/mpeg mp3;
+    font/woff woff;
+    font/woff2 woff2;
+}
