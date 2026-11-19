@@ -16,7 +16,6 @@ use rustls::server::{NoServerSessionStorage, StoresServerSessions};
 use rustls::ServerConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// The crypto provider shared by every listener: rustls' `ring` backend, which supports
 /// the TLS 1.2 AEAD suites and the three key exchange groups Nginx maps from
@@ -171,10 +170,7 @@ enum Keyword {
     ComplementOfDefault,
     High,
     Default,
-    Ecdhe,
     Aead,
-    AesGcm,
-    ChaCha20,
 }
 
 impl Keyword {
@@ -183,13 +179,14 @@ impl Keyword {
             "ALL" => Some(Self::All),
             "COMPLEMENTOFALL" => Some(Self::ComplementOfAll),
             "COMPLEMENTOFDEFAULT" => Some(Self::ComplementOfDefault),
-            "HIGH" | "AES" | "AESGCM" | "CHACHA20" | "ECDHE" | "EECDH" | "kECDHE" | "aRSA"
-            | "aECDSA" => Some(Self::High),
+            // rustls only implements high-strength AEAD suites, so every strength and
+            // algorithm selector Nginx configs use (`HIGH`, `AES`, `AESGCM`, `CHACHA20`,
+            // `ECDHE`, `kECDHE`, `aRSA`, `aECDSA`) resolves to that one set.
+            "HIGH" | "AES" | "AESGCM" | "CHACHA20" | "ECDHE" | "EECDH" | "kECDHE" | "aRSA" | "aECDSA" => {
+                Some(Self::High)
+            }
             "DEFAULT" => Some(Self::Default),
-            "ECDHE" => Some(Self::Ecdhe),
             "AEAD" => Some(Self::Aead),
-            "AESGCM" => Some(Self::AesGcm),
-            "CHACHA20" => Some(Self::ChaCha20),
             _ => None,
         }
     }
@@ -197,15 +194,15 @@ impl Keyword {
     fn matches(&self, suites: &[&str]) -> Vec<String> {
         suites
             .iter()
-            .filter(|name| match self {
+            .filter(|_name| match self {
                 Self::All => true,
                 // Everything rustls implements is high strength and AEAD.
                 Self::High => true,
                 Self::Default => true,
                 Self::ComplementOfAll | Self::ComplementOfDefault => false,
-                Self::Ecdhe => name.contains("ECDHE"),
-                Self::Aead | Self::AesGcm => name.contains("GCM"),
-                Self::ChaCha20 => name.contains("CHACHA20"),
+                // Every suite rustls implements is AEAD, and `AESGCM`/`CHACHA20`/`ECDHE`
+                // select that same set through the `High` alias.
+                Self::Aead => true,
             })
             .map(|name| name.to_string())
             .collect()
@@ -268,7 +265,7 @@ pub fn normalize_alias(name: &str) -> String {
             return dashed;
         }
     }
-    // OpenSSL 1.0 style: `ECDHE-RSA-AES128-GCM-SHA256` → `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`.
+    // OpenSSL 1.0 style: `ECDHE-RSA-AES128-GCM-SHA256` 鈫?`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`.
     let mut parts: Vec<&str> = dashed.split('_').collect();
     if parts.first().is_some_and(|part| matches!(*part, "ECDHE" | "DHE" | "ECDH" | "AES")) {
         let mut auth = None;
@@ -293,7 +290,7 @@ pub fn normalize_alias(name: &str) -> String {
     }
 }
 
-/// `ssl_ecdh_curve` → key exchange groups (`auto`, `prime256v1`, `secp384r1`, `X25519`).
+/// `ssl_ecdh_curve` 鈫?key exchange groups (`auto`, `prime256v1`, `secp384r1`, `X25519`).
 pub fn select_kx_groups(
     curve: &str,
     provider: &Arc<CryptoProvider>,

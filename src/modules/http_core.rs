@@ -104,7 +104,7 @@ fn dispatch_to_compiler(_: &mut crate::modules::DirectiveView<'_>) -> Result<()>
 /// `http {}`-level MIME configuration (`types`, `default_type`).
 #[derive(Clone, Debug, Default)]
 pub struct MimeConfig {
-    /// extension (lowercase) → content type
+    /// extension (lowercase) 鈫?content type
     pub types: std::collections::HashMap<String, String>,
     pub default_type: String,
 }
@@ -315,7 +315,8 @@ impl<'a> HttpCompiler<'a> {
                 }
             }
         }
-        // Pass 2: virtual hosts.
+        // `http {}`-level SSL settings are the parent of every server's merge.
+        self.capture_http_tls(states);
         for child in &children {
             if child.name == "server" {
                 self.compile_server(child, states)?;

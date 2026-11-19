@@ -1,4 +1,4 @@
-//! `$ssl_*` variables (`ngx_http_ssl_static_variable` / `ngx_http_ssl_variable`).
+﻿//! `$ssl_*` variables (`ngx_http_ssl_static_variable` / `ngx_http_ssl_variable`).
 //!
 //! The values come from the handshake snapshot stored on the connection
 //! ([`SslSession`]); TLS facts only exist on `listen ... ssl` servers, where every other
@@ -8,7 +8,6 @@ use crate::core::VariableProvider;
 use crate::core::http::RequestState;
 use base64::Engine;
 use std::sync::Arc;
-use x509_parser::prelude::*;
 
 /// Facts captured after the TLS handshake.
 #[derive(Clone, Debug, Default)]
@@ -51,13 +50,6 @@ impl SslSession {
         } else {
             "FAILED"
         }
-    }
-
-    fn leaf(&self) -> Option<X509Certificate<'_>> {
-        let der = self.client_chain.first()?;
-        let (_, parsed) = x509_parser::parse_x509_certificate(der).ok()?;
-        // The certificate borrows from `Self`; callers clone the rendered string.
-        Some(parsed)
     }
 }
 
@@ -130,32 +122,32 @@ pub fn signature_algorithm(der: &[u8]) -> Option<String> {
 /// Providers registered by [`crate::modules::ssl::SslModule::variables`].
 pub fn providers() -> Vec<(&'static str, &'static dyn VariableProvider)> {
     vec![
-        ("SslProtocol", &SslProtocol),
-        ("SslCipher", &SslCipher),
-        ("SslCiphers", &SslCiphers),
-        ("SslCurve", &SslCurve),
-        ("SslCurves", &SslCurves),
-        ("SslSigalg", &SslSigalg),
-        ("SslSigalgs", &SslSigalgs),
-        ("SslSessionId", &SslSessionId),
-        ("SslSessionReused", &SslSessionReused),
-        ("SslEarlyData", &SslEarlyData),
-        ("SslServerName", &SslServerName),
-        ("SslAlpnProtocol", &SslAlpnProtocol),
-        ("SslClientCert", &SslClientCert),
-        ("SslClientRawCert", &SslClientRawCert),
-        ("SslClientEscapedCert", &SslClientEscapedCert),
-        ("SslClientSubjectDn", &SslClientSubjectDn),
-        ("SslClientIssuerDn", &SslClientIssuerDn),
-        ("SslClientSubjectDnLegacy", &SslClientSubjectDnLegacy),
-        ("SslClientIssuerDnLegacy", &SslClientIssuerDnLegacy),
-        ("SslClientSerial", &SslClientSerial),
-        ("SslClientFingerprint", &SslClientFingerprint),
-        ("SslClientVerify", &SslClientVerify),
-        ("SslClientValidStart", &SslClientValidStart),
-        ("SslClientValidEnd", &SslClientValidEnd),
-        ("SslClientValidRemain", &SslClientValidRemain),
-        ("SslClientSigalg", &SslClientSigalg),
+        ("ssl_protocol", &SslProtocolName),
+        ("ssl_cipher", &SslCipher),
+        ("ssl_ciphers", &SslCiphers),
+        ("ssl_curve", &SslCurve),
+        ("ssl_curves", &SslCurves),
+        ("ssl_sigalg", &SslSigalg),
+        ("ssl_sigalgs", &SslSigalgs),
+        ("ssl_session_id", &SslSessionId),
+        ("ssl_session_reused", &SslSessionReused),
+        ("ssl_early_data", &SslEarlyData),
+        ("ssl_server_name", &SslServerName),
+        ("ssl_alpn_protocol", &SslAlpnProtocol),
+        ("ssl_client_cert", &SslClientCert),
+        ("ssl_client_raw_cert", &SslClientRawCert),
+        ("ssl_client_escaped_cert", &SslClientEscapedCert),
+        ("ssl_client_s_dn", &SslClientSubjectDn),
+        ("ssl_client_i_dn", &SslClientIssuerDn),
+        ("ssl_client_s_dn_legacy", &SslClientSubjectDnLegacy),
+        ("ssl_client_i_dn_legacy", &SslClientIssuerDnLegacy),
+        ("ssl_client_serial", &SslClientSerial),
+        ("ssl_client_fingerprint", &SslClientFingerprint),
+        ("ssl_client_verify", &SslClientVerify),
+        ("ssl_client_v_start", &SslClientValidStart),
+        ("ssl_client_v_end", &SslClientValidEnd),
+        ("ssl_client_v_remain", &SslClientValidRemain),
+        ("ssl_client_sigalg", &SslClientSigalg),
     ]
 }
 

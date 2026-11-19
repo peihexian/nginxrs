@@ -1,4 +1,4 @@
-﻿//! The HTTP request engine.
+//! The HTTP request engine.
 //!
 //! This is the only place that knows the order of Nginx phases; concrete behaviour lives
 //! in modules:
@@ -28,7 +28,6 @@ use crate::modules::writer::ResponseWriter;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use http::{StatusCode, Uri};
-use pingora_core::server::ShutdownWatch;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -677,11 +676,6 @@ impl HttpCoreApp {
             status,
             message.as_deref(),
         );
-    }
-
-    /// HTTP server options handed to Pingora's proxy layer.
-    fn server_options(&self) -> Arc<pingora_core::server::configuration::ServerConf> {
-        self.engine.load().server_conf.clone()
     }
 }
 

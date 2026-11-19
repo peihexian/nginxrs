@@ -1,13 +1,13 @@
-//! `ngx_http_ssl_module`.
+﻿//! `ngx_http_ssl_module`.
 //!
 //! Nginx enables HTTPS with `listen ... ssl` and configures TLS through the SSL module's
 //! directives. This module mirrors `c/nginx/src/http/modules/ngx_http_ssl_module.c`:
 //!
-//! * `srv_conf` — one [`TlsServerConf`] per `server {}` block, merged at the end of the
+//! * `srv_conf` 鈥?one [`TlsServerConf`] per `server {}` block, merged at the end of the
 //!   block like `ngx_http_ssl_merge_srv_conf` (inherits `http {}` values, applies the
 //!   built-in defaults, validates certificates, sessions and verification);
-//! * `loc_conf` — the `ssl` flag (`ngx_http_ssl_loc_conf_t`), taken from `listen ... ssl`;
-//! * runtime — one rustls `ServerConfig` per TLS server, selected by SNI at handshake time
+//! * `loc_conf` 鈥?the `ssl` flag (`ngx_http_ssl_loc_conf_t`), taken from `listen ... ssl`;
+//! * runtime 鈥?one rustls `ServerConfig` per TLS server, selected by SNI at handshake time
 //!   (`ngx_http_ssl_servername`), plus the per-connection facts exposed as `$ssl_*`
 //!   variables (`ngx_http_ssl_variable`).
 
@@ -93,7 +93,7 @@ impl Module for SslModule {
     }
 
     fn directives(&self) -> Vec<DirectiveSpec> {
-        let mut specs = vec![
+        let specs = vec![
             // Server context, `NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF`, one or more
             // `[name:path ...]` arguments.
             spec("ssl_certificate", &[Context::Server], ssl_certificate),

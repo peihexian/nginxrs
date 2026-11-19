@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, bail};
+﻿use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nginxrs::config::Config;
-use nginxrs::core::http_core::{Engine, HttpCoreApp};
+use nginxrs::core::http_core::Engine;
 use nginxrs::core::reload::{self, Reloader};
 use nginxrs::modules::balancer::Upstream;
 use nginxrs::modules::log::{AccessLogConfig, AccessLogWriter, LogTarget};
