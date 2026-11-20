@@ -17,8 +17,79 @@ use crate::core::layout::IndentStyle;
 use crate::core::maintain::{self, BeautifyOptions, Ctx, Report, STUB_MARKER};
 use anyhow::{Context, Result, bail};
 use std::path::{Component, Path, PathBuf};
+/// Drop the Windows `\\?\` prefix, which `glob` cannot expand into existing paths.
+fn plain_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
+}
 
+
+fn discover(root: &Path, report: &mut Report) -> Result<Vec<SourceFile>> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot open {}", root.display()))?;
+    let mut files: Vec<SourceFile> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut stack: Vec<(PathBuf, Option<PathBuf>)> = vec![(root, None)];
+    while let Some((path, parent)) = stack.pop() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                report.note(format!("cannot read {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let directives = match crate::core::syntax::parse_source_with_path(&text, &path) {
+            Ok(directives) => directives,
+            Err(error) => {
+                report.note(format!("{error:#}"));
+                Vec::new()
+            }
+        };
+        let base = plain_path(path.parent().unwrap_or(Path::new(".")));
+        let mut arguments = Vec::new();
+        collect_includes(&directives, &mut arguments);
+        for argument in arguments {
+                match source::expand_include(&base, &argument) {
+                Ok(paths) => {
+                    for selected in paths {
+                        stack.push((selected, Some(path.clone())));
+                    }
+                }
+                Err(error) => report.note(format!("{error:#}")),
+            }
+        }
+        files.push(SourceFile {
+            path,
+            directives,
+            parent,
+        });
+    }
+    files.sort_by_key(|file| if file.parent.is_none() { 0 } else { 1 });
+    Ok(files)
+}
+
+/// Every `include` argument of a directive tree, wherever the statement is written.
+fn collect_includes(directives: &[crate::core::syntax::Directive], out: &mut Vec<String>) {
+    for directive in directives {
+        if directive.name == "include"
+            && let Some(argument) = directive.args.first()
+        {
+            out.push(argument.clone());
+        }
+        if let Some(children) = &directive.children {
+            collect_includes(children, out);
+        }
+    }
+}
 /// `-t`: validate a configuration file and everything it includes.
+
 pub fn test(config: &Path) -> Result<Config> {
     Config::load(config)
 }
@@ -32,9 +103,14 @@ pub fn beautify(config: &Path, options: &BeautifyOptions) -> Result<Report> {
     let config = config
         .canonicalize()
         .with_context(|| format!("cannot open configuration {}", config.display()))?;
-    let files = source::load(&config)?;
+    let mut report = Report::default();
+    // The files are discovered leniently: a tree that `-t` rejects is exactly the kind of
+    // tree operators ask to be reformatted, and every rewrite is validated afterwards.
+    let files = discover(&config, &mut report)?;
     let ctx = maintain::build(&files)?;
-    let expected = test(&config)?;
+    let expected = Config::load(&config)
+        .with_context(|| format!("{} is not a valid configuration", config.display()))?;
+    report.files_read = files.len();
 
     let mut report = Report {
         files_read: files.len(),
@@ -57,7 +133,7 @@ pub fn beautify(config: &Path, options: &BeautifyOptions) -> Result<Report> {
         ));
     }
 
-    verify(&config, &config.clone(), &ctx, &outputs, &expected, options.verbose, &mut report)?;
+    verify(&config, &config, &ctx, &outputs, &expected, options.verbose, &mut report)?;
 
     report.files_rendered = outputs.len();
     report.stubs = outputs
@@ -260,7 +336,62 @@ pub fn recreate(source: &Path, target: &Path, options: &BeautifyOptions) -> Resu
         outputs.push((rel, text));
     }
 
-    verify(&entry, &ctx.rel, &ctx, &outputs, &expected, options.verbose, &mut report)?;
+    // Resources the configuration reads at run time (Lua hooks, certificates) are copied
+    // too, so the new tree compiles and serves exactly like the old one.
+    let mut resources: Vec<PathBuf> = Vec::new();
+    {
+        let mut tree: Vec<&Ctx> = Vec::new();
+        ctx.files(&mut tree);
+        for node in &tree {
+            let file = entry.parent().unwrap_or(Path::new(".")).join(&node.rel);
+            let base = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let values = maintain::referenced_resources(&node.source.directives());
+            for value in values {
+                let path = crate::core::value::resolve_path(&base, &value);
+                if path.is_file() {
+                    resources.push(path.canonicalize().unwrap_or(path));
+                } else {
+                    report.note(format!(
+                        "{}:{}: {} is not a file and is not copied",
+                        node.path.display(),
+                        0,
+                        value
+                    ));
+                }
+            }
+        }
+        resources.sort();
+        resources.dedup();
+    }
+
+    if options.write {
+        // The copy is complete before it is compiled, so resources resolve inside it.
+        std::fs::create_dir_all(&target)
+            .with_context(|| format!("cannot create {}", target.display()))?;
+        for (rel, text) in &outputs {
+            let destination = target.join(rel);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot create {}", parent.display()))?;
+            }
+            std::fs::write(&destination, text)
+                .with_context(|| format!("cannot write {}", destination.display()))?;
+        }
+        for resource in &resources {
+            let rel = node_rel_path(resource, &source_dir);
+            let destination = target.join(&rel);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot create {}", parent.display()))?;
+            }
+            std::fs::copy(resource, &destination).with_context(|| {
+                format!("cannot copy {} to {}", resource.display(), destination.display())
+            })?;
+        }
+    }
+    let target_entry = target.join(&ctx.rel);
+    let target_entry = target_entry.canonicalize().unwrap_or(target_entry);
+    verify(&target_entry, &target_entry, &ctx, &outputs, &expected, options.verbose, &mut report)?;
 
     report.files_rendered = outputs.len();
     report.stubs = outputs
@@ -280,9 +411,25 @@ pub fn recreate(source: &Path, target: &Path, options: &BeautifyOptions) -> Resu
             std::fs::write(&destination, text)
                 .with_context(|| format!("cannot write {}", destination.display()))?;
         }
+        for resource in &resources {
+            let rel = node_rel_path(resource, &source_dir);
+            let destination = target.join(&rel);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot create {}", parent.display()))?;
+            }
+            std::fs::copy(resource, &destination).with_context(|| {
+                format!(
+                    "cannot copy {} to {}",
+                    resource.display(),
+                    destination.display()
+                )
+            })?;
+        }
         report.note(format!(
-            "wrote {} file(s) to {}",
+            "wrote {} configuration file(s) and {} resource(s) to {}",
             outputs.len(),
+            resources.len(),
             target.display()
         ));
     } else {
@@ -294,6 +441,12 @@ pub fn recreate(source: &Path, target: &Path, options: &BeautifyOptions) -> Resu
     Ok(report)
 }
 
+/// Relative path of a source file below `source_dir`, or its file name when it is outside.
+fn node_rel_path(path: &Path, source_dir: &Path) -> PathBuf {
+    path.strip_prefix(source_dir)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| PathBuf::from(path.file_name().unwrap_or_default()))
+}
 /// The configuration file of a directory.
 fn find_entry(dir: &Path) -> Result<PathBuf> {
     let mut found: Vec<PathBuf> = ["nginx.conf", "nginxrs.conf"]
@@ -376,7 +529,7 @@ fn normalize(path: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------------------
 
 fn verify(
-    entry: &Path,
+    _entry: &Path,
     root: &Path,
     ctx: &Ctx,
     outputs: &[(PathBuf, String)],
@@ -385,7 +538,7 @@ fn verify(
     report: &mut Report,
 ) -> Result<()> {
     // Original files, in load order, and the text of every rendered file.
-    let original = source::load(&ctx.path)?;
+    let original = discover(&ctx.path, report)?;
     let rendered: Vec<(PathBuf, String)> = outputs
         .iter()
         .map(|(path, text)| {
@@ -428,15 +581,28 @@ fn verify(
         .unwrap_or_default();
     // The rendered `include` directives name files below the output root; the check reads
     // them from the rendered texts, not from whatever the original tree still holds.
-    let rendered_lookup: std::collections::HashMap<String, String> = rendered
+    // The rendered files are keyed by their path in the output tree, not by the path the
+    // source file had, so a copy in another directory verifies against its own layout.
+    let output_key = |name: &Path| -> String { plain_path(name).to_string_lossy().to_ascii_lowercase() };
+    let root_dir = root.parent().unwrap_or(Path::new("."));
+    let rendered_lookup: std::collections::HashMap<String, String> = outputs
         .iter()
-        .map(|(path, text)| (path.to_string_lossy().to_ascii_lowercase(), text.clone()))
+        .filter_map(|(path, text)| {
+            // The output path is the source path below the configuration directory; a
+            // file outside it keeps its own name.
+            let rel = path
+                .strip_prefix(Path::new(&ctx.rel).parent().unwrap_or(Path::new(".")))
+                .or_else(|_| path.strip_prefix(&ctx.rel))
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| PathBuf::from(path.file_name().unwrap_or_default()));
+            let target = root_dir.join(rel);
+            Some((output_key(&target), text.clone()))
+        })
         .collect();
-    let output_root = root.to_path_buf();
+    let output_root = root.parent().unwrap_or(Path::new(".")).join(&ctx.rel);
     let expanded_root = expand_rendered(root_text, &output_root, &rendered_lookup);
     let _ = root;
     let root_text = expanded_root;
-    std::fs::write("F:/temp/expanded_debug.conf", &root_text).ok();
     let check = Config::parse_at(&root_text, root.parent().unwrap_or(Path::new(".")))
         .context("the rendered configuration does not compile")?;
     compare_structure(expected, &check)?;
@@ -450,64 +616,82 @@ fn verify(
     Ok(())
 }
 
-/// Splice the rendered `include` files into the text of their includer, so the result can
-/// be compiled without reading the original files.
+
+/// Splice the rendered `include` files into the text of their includer, recursively, so the
+/// result can be compiled without reading the original files.
 fn expand_rendered(
     text: &str,
     path: &Path,
     files: &std::collections::HashMap<String, String>,
 ) -> String {
-    let base = path.parent().unwrap_or(Path::new("."));
+    expand_rendered_at(text, path, files, 0)
+}
+
+fn expand_rendered_at(
+    text: &str,
+    path: &Path,
+    files: &std::collections::HashMap<String, String>,
+    depth: usize,
+) -> String {
+    let parsed = match crate::core::syntax::parse_source_with_path(text, path) {
+        Ok(directives) => directives,
+        Err(_) => return text.to_string(),
+    };
     let mut out = String::new();
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let argument = trimmed
-            .strip_prefix("include ")
-            .map(|rest| rest.trim_start().trim_end().trim_end_matches(';').trim_end());
-        let Some(argument) = argument else {
-            out.push_str(line);
-            continue;
-        };
-        let target = base.join(argument);
-        let name = target.file_name().map(|name| name.to_string_lossy().to_ascii_lowercase());
-        let replacement = name.and_then(|name| {
-            files
-                .iter()
-                .find(|(key, _)| {
-                    Path::new(key)
-                        .file_name()
-                        .map(|file| file.to_string_lossy().to_ascii_lowercase() == name)
-                        .unwrap_or(false)
-                })
-                .map(|(_, content)| content.clone())
-        });
-        match replacement {
-            Some(content) => {
-                out.push_str(&content);
-                if !content.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            None => out.push_str(line),
-        }
-    }
+    expand_directives(&parsed, path, files, depth, &mut out);
     out
 }
-/// The directive tree of one file tree with its `include`s kept as written.
-fn include_tree(files: &[SourceFile], root: &Path, base: &Path) -> Result<Vec<crate::core::syntax::Directive>> {
-    let _ = base;
-    let index: std::collections::HashMap<&PathBuf, &SourceFile> = files.iter().map(|f| (&f.path, f)).collect();
-    // The root file of the walk is the one whose parent is unset and whose path is `root`,
-    // or the first file when a caller supplies no parents.
-    let entry = files
-        .iter()
-        .find(|file| &file.path == root)
-        .or_else(|| files.iter().find(|file| file.parent.is_none()))
-        .or_else(|| files.first());
-    let _ = index;
-    match entry {
-        Some(file) => Ok(file.directives.clone()),
-        None => Ok(Vec::new()),
+
+/// Render `directives` with every `include` replaced by the rendered files it selects.
+fn expand_directives(
+    directives: &[crate::core::syntax::Directive],
+    path: &Path,
+    files: &std::collections::HashMap<String, String>,
+    depth: usize,
+    out: &mut String,
+) {
+    let indent = "    ".repeat(depth);
+    for directive in directives {
+        if directive.name == "include"
+            && !directive.has_block()
+            && let Some(argument) = directive.args.first()
+        {
+            let joined = plain_path(&path.parent().unwrap_or(Path::new(".")).join(argument));
+            let pattern = joined.to_string_lossy().to_ascii_lowercase();
+            let mut selected: Vec<(PathBuf, String)> = files
+                .iter()
+                .filter(|(key, _)| {
+                    crate::core::source::expand_include_path(&pattern, key).unwrap_or(false)
+                })
+                .map(|(key, content)| (plain_path(Path::new(key)), content.clone()))
+                .collect();
+            selected.sort();
+            if !selected.is_empty() && depth < 16 {
+                for (target, content) in selected {
+                    let inner = expand_rendered_at(&content, &target, files, depth);
+                    for line in inner.lines() {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        out.push_str(&indent);
+                        out.push_str(line.trim_start());
+                        out.push('\n');
+                    }
+                }
+                continue;
+            }
+        }
+        out.push_str(&indent);
+        out.push_str(&crate::core::layout::format_directive(directive));
+        match &directive.children {
+            Some(children) => {
+                out.push_str(" {\n");
+                expand_directives(children, path, files, depth + 1, out);
+                out.push_str(&indent);
+                out.push_str("}\n");
+            }
+            None => out.push_str(";\n"),
+        }
     }
 }
 

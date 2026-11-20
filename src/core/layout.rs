@@ -148,6 +148,12 @@ pub fn flatten_directives(items: &[Item], out: &mut Vec<Directive>) {
     }
 }
 
+/// The directive tree of a block body.
+pub fn flatten_into(items: &[Item], out: &mut Vec<Directive>) {
+    flatten_directives(items, out);
+}
+
+
 /// The statement without its body items, but with its body as a directive list.
 pub fn standalone(item: &DirectiveItem) -> Directive {
     let mut directive = item.directive.clone();

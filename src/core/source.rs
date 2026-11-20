@@ -82,18 +82,74 @@ pub fn expand_include(base: &Path, argument: &str) -> Result<Vec<PathBuf>> {
     } else {
         base.join(pattern)
     };
+    // `glob` treats `\` as an escape character, so Windows separators are converted to the
+    // platform separator before matching; the returned paths keep the caller's form.
     let text = pattern.to_string_lossy().into_owned();
     if !text.contains(['*', '?', '[']) {
         return Ok(vec![pattern]);
     }
+    let glob_text = if std::path::MAIN_SEPARATOR == '\\' {
+        text.replace('\\', "/")
+    } else {
+        text.clone()
+    };
     let mut paths = Vec::new();
-    for entry in glob::glob(&text).with_context(|| format!("invalid include pattern {text}"))? {
-        paths.push(entry?);
+    for entry in glob::glob(&glob_text).with_context(|| format!("invalid include pattern {text}"))? {
+        let path = entry?;
+        let mapped = if std::path::MAIN_SEPARATOR == '\\' {
+            PathBuf::from(path.to_string_lossy().replace('/', "\\"))
+        } else {
+            path
+        };
+        paths.push(mapped);
     }
     paths.sort();
     Ok(paths)
 }
+/// Whether a file path matches an `include` pattern such as `vhost/*.conf`.
+pub fn expand_include_path(pattern: &str, candidate: &str) -> Result<bool> {
+    let normalized = |text: &str| -> Vec<String> {
+        let text = match text.strip_prefix(r"\\?\") {
+            Some(rest) => rest.to_string(),
+            None => text.to_string(),
+        };
+        text.split(['\\', '/'])
+            .filter(|part| !part.is_empty())
+            .map(|part| part.to_ascii_lowercase())
+            .collect()
+    };
+    let pattern = normalized(pattern);
+    let candidate = normalized(candidate);
+    Ok(segment_match(&pattern, &candidate))
+}
 
+/// Match one path against another where `*` and `?` may appear in any segment.
+fn segment_match(pattern: &[String], candidate: &[String]) -> bool {
+    match pattern.split_first() {
+        None => candidate.is_empty(),
+        Some((head, rest)) if head == "**" => {
+            (0..=candidate.len()).any(|skip| segment_match(rest, &candidate[skip..]))
+        }
+        Some((head, rest)) => match candidate.split_first() {
+            Some((first, tail)) if glob_match(head, first) => segment_match(rest, tail),
+            _ => false,
+        },
+    }
+}
+/// One-segment `*` and `?` matching.
+fn glob_match(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    fn walk(pattern: &[char], value: &[char]) -> bool {
+        match pattern.split_first() {
+            None => value.is_empty(),
+            Some(('*', rest)) => (0..=value.len()).any(|skip| walk(rest, &value[skip..])),
+            Some(('?', rest)) => !value.is_empty() && walk(rest, &value[1..]),
+            Some((ch, rest)) => value.first() == Some(ch) && walk(rest, &value[1..]),
+        }
+    }
+    walk(&pattern, &value)
+}
 struct Walker {
     files: Vec<SourceFile>,
     /// Canonical paths already read (Nginx opens each file once, `NGX_CONF_UNSET_UINT`).

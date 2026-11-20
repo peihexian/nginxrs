@@ -454,6 +454,11 @@ fn finish_node(ctx: &mut Ctx) {
 
 impl Ctx {
     /// The `include` argument in this file that opened `target`.
+    /// Directory the `include` arguments of this file resolve against.
+    fn include_base(&self) -> PathBuf {
+        self.original_dir.clone()
+    }
+
     fn argument_for(&self, target: &Path) -> String {
         let mut found = String::new();
         fn walk(items: &[Item], base: &Path, target: &Path, found: &mut String) {
@@ -480,7 +485,7 @@ impl Ctx {
                 walk(&item.body, base, target, found);
             }
         }
-        walk(&self.source.items, &self.original_dir, target, &mut found);
+        walk(&self.source.items, &self.include_base(), target, &mut found);
         found
     }
 }
@@ -826,15 +831,29 @@ pub fn include_closure(base: &Path, files: &[SourceFile]) -> Vec<PathBuf> {
 }
 
 /// The directives of every file of `closure` as `(depth, name, args)` rows, sorted.
+/// `true` for a file that only holds one `types` block (a `mime.types` table); such a file
+/// is a value table read through its `include`, not a configuration fragment.
+pub fn is_value_table(directives: &[Directive]) -> bool {
+    directives.len() == 1 && directives[0].name == "types" && directives[0].has_block()
+}
 pub fn tree_signature(files: &[SourceFile]) -> Vec<(usize, String, Vec<String>)> {
     let mut rows = Vec::new();
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
+        // A file that stands alone keeps its own tree. A merged fragment is not a tree:
+        // its statements belong to the block that includes it, so it adds no rows.
+        if index > 0 && file.parent.is_some() {
+            if is_value_table(&file.directives) {
+                append_rows(&file.directives, 0, &mut rows);
+            } else if file.directives.iter().any(|directive| directive.has_block()) {
+                append_rows(&file.directives, 0, &mut rows);
+            }
+            continue;
+        }
         append_rows(&file.directives, 0, &mut rows);
     }
     rows.sort();
     rows
 }
-
 fn append_rows(directives: &[Directive], depth: usize, out: &mut Vec<(usize, String, Vec<String>)>) {
     for directive in directives {
         out.push((depth, directive.name.clone(), directive.args.clone()));
@@ -842,6 +861,44 @@ fn append_rows(directives: &[Directive], depth: usize, out: &mut Vec<(usize, Str
             append_rows(children, depth + 1, out);
         }
     }
+}
+
+/// Files a directive tree refers to that are not configuration (`content_by_lua_file`,
+/// certificates, ...). They are copied so the new tree can be compiled and served.
+pub fn referenced_resources(directives: &[Directive]) -> Vec<String> {
+    let mut out = Vec::new();
+    for directive in directives {
+        let resource = matches!(
+            directive.name.as_str(),
+            "ssl_certificate"
+                | "ssl_certificate_key"
+                | "ssl_client_certificate"
+                | "ssl_trusted_certificate"
+                | "ssl_crl"
+                | "ssl_dhparam"
+                | "ssl_stapling_file"
+                | "ssl_password_file"
+                | "ssl_session_ticket_key"
+                | "proxy_ssl_certificate"
+                | "proxy_ssl_certificate_key"
+                | "proxy_ssl_trusted_certificate"
+                | "content_by_lua_file"
+                | "access_by_lua_file"
+                | "rewrite_by_lua_file"
+                | "header_filter_by_lua_file"
+                | "body_filter_by_lua_file"
+        );
+        if resource
+            && let Some(path) = directive.args.first()
+            && !path.contains('$')
+        {
+            out.push(path.clone());
+        }
+        if let Some(children) = &directive.children {
+            out.extend(referenced_resources(children));
+        }
+    }
+    out
 }
 
 /// The `include` arguments of a directive tree.
