@@ -64,7 +64,7 @@ src/
 - **Lua**：`access_by_lua_*`、`rewrite_by_lua_*`、`content_by_lua_*`、`header_filter_by_lua_*`，见下文 API。
 - **流媒体分发**：HLS (`.m3u8/.ts`)、DASH (`.mpd/.m4s`)、MP4 等文件的 MIME、流式分块与 Range；反代路径默认按
   `proxy_buffering` 走事件管道缓冲（内存 + `proxy_temp_path` 临时文件），可用 `proxy_buffering off` 改成逐块转发。
-- **运维**：`-t` 配置检查、Nginx combined 风格访问日志、Rust/env_logger 运行日志。
+- **运维**：`-t` 配置检查、`-T` 导出全部生效配置、`-b` 格式化排版美化、`-r` 重建干净的配置目录、Nginx combined 风格访问日志、Rust/env_logger 运行日志。
 
 ## 构建与运行
 
@@ -94,6 +94,43 @@ Linux/macOS 使用相同 Cargo 命令，产物为 `target/release/nginxrs`。
 - `/legacy/...` 会 301 到 `/media/...`。
 
 相对路径以**主配置文件所在目录**为基准。例如 `conf/nginxrs.conf` 中的 `root ../www` 指向项目根目录的 `www`。
+
+## 配置维护：格式化与重建
+
+线上配置常由多人手工维护，排版混乱、历史备份与临时文件堆积。下面两个命令都作用于**实际加载的配置
+树**（主配置 + 逐级 `include` 到的文件），与 `-t` 使用同一套 include 解析规则（相对路径以包含它的文件
+所在目录为基准、`glob` 结果按文件名排序、每个文件只读取一次）。
+
+### `-b` / `--beautify`：格式化排版美化
+
+```powershell
+nginxrs -c /etc/nginx/nginx.conf -b          # 只检查并报告，不写文件
+nginxrs -c /etc/nginx/nginx.conf -b -w       # 就地重写主配置及其 include 的所有文件
+nginxrs -c /etc/nginx/nginx.conf -b -w --indent t   # 用制表符缩进（默认 4 个空格）
+```
+
+- 处理范围与 `-t` 一致：主配置、`include` 的子目录、`include` 的多级目录、`snippets.conf` 这类片段文件。
+- 保留注释、注释位置、空行、语句顺序和引号语义；只重排缩进与语句间空白。
+- **写完自检**：先在内存中渲染整棵树并重新解析，确认每条指令、每个注释都还在，再与 `-t`
+  编译结果比对服务器/location/监听结构；全部通过后才落盘。
+- 只含裸指令（如 `server_tokens off;`、`client_max_body_size 64m;`）的片段文件不能独立加载，
+  其指令会被合并进包含它的块，原文件改写为 `#vhosts-conf# merged into ...` 指针，保证 `-b` 前后
+  语义不变。
+- `-b` 不会删除任何文件，历史备份文件保持原样。
+
+### `-r` / `--recreate`：重建干净的配置目录
+
+```powershell
+nginxrs -r /etc/nginx /data/nginx-conf-new
+```
+
+- 第一个参数是原配置目录（自动寻找其中的 `nginx.conf` 或 `nginxrs.conf`），也可以直接传配置文件；
+  第二个参数是新目录。
+- 只复制**实际生效**的配置：主配置、`include` 命中的文件（含子目录中的 vhost），以及运行时依赖的
+  Lua 脚本、证书等资源；`*.bak`、`*date.conf`、`*iplist.conf` 这类残留文件不会被复制。
+- 新目录中的相对路径与原树保持相同的层级，`include` 语句因此照常生效；复制完成后在新目录里重新
+  编译校验，结构一致才算成功。
+- 新目录必须位于原配置目录之外（包括其子目录），否则直接报错退出，避免把旧树写坏。
 
 ## 示例配置
 

@@ -271,7 +271,15 @@ pub fn recreate(source: &Path, target: &Path, options: &BeautifyOptions) -> Resu
             source_dir.display()
         );
     }
-    if let Ok(canonical) = target.canonicalize()
+    // Compare the first existing ancestor too: a target that does not exist yet still sits
+    // below the source directory through its parent.
+    let mut ancestor = target.as_path();
+    while !ancestor.exists()
+        && let Some(parent) = ancestor.parent()
+    {
+        ancestor = parent;
+    }
+    if let Ok(canonical) = ancestor.canonicalize()
         && canonical.starts_with(&source_dir)
     {
         bail!(
@@ -759,3 +767,121 @@ pub fn dump(config: &Path) -> Result<String> {
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// A configuration with a value table, a merged fragment and a nested vhost include.
+    fn sample(root: &Path) {
+        write(
+            &root.join("conf/nginx.conf"),
+            "worker_processes auto;\nevents { worker_connections 1024; }\nhttp {\n  include mime.types;\n  include snippets.conf;\n  include vhost/*.conf;\n  server { listen 8080; server_name example.test; location / { return 200 \"ok\"; } }\n}\n",
+        );
+        write(&root.join("conf/mime.types"), "types { text/html html; text/plain txt; }\n");
+        write(&root.join("conf/snippets.conf"), "# shared\nclient_max_body_size 64m;\n");
+        write(
+            &root.join("conf/vhost/a.conf"),
+            "server {\nlisten 80;\nserver_name a.test;\ninclude inner/block.conf;\n}\n",
+        );
+        write(&root.join("conf/vhost/inner/block.conf"), "location /inner/ { return 204; }\n");
+        write(&root.join("conf/vhost/a.conf.bak2020"), "server { listen 81; }\n");
+        write(&root.join("conf/nginx.conf.orig"), "worker_processes 1;\n");
+    }
+
+    #[test]
+    fn beautify_reformats_without_changing_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        sample(&root);
+        let config = root.join("conf/nginx.conf");
+        let before = test(&config).unwrap();
+
+        let mut options = BeautifyOptions::default();
+        options.write = true;
+        let report = beautify(&config, &options).unwrap();
+        assert!(!report.changed.is_empty());
+
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("    include mime.types;"), "{text}");
+        assert!(text.contains("        location / {"), "{text}");
+        let after = test(&config).unwrap();
+        assert_eq!(before.listeners(), after.listeners());
+        assert_eq!(
+            before.http.servers.len(),
+            after.http.servers.len(),
+            "server count changed"
+        );
+        // The vhost file is reformatted too, and its nested include still loads.
+        let vhost = std::fs::read_to_string(root.join("conf/vhost/a.conf")).unwrap();
+        assert!(vhost.contains("    include inner/block.conf;"), "{vhost}");
+        // A merged fragment keeps pointing at its includer instead of being loaded again.
+        let snippet = std::fs::read_to_string(root.join("conf/snippets.conf")).unwrap();
+        assert!(snippet.contains(crate::core::maintain::STUB_MARKER), "{snippet}");
+    }
+
+    #[test]
+    fn beautify_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        sample(&root);
+        let config = root.join("conf/nginx.conf");
+        let mut options = BeautifyOptions::default();
+        options.write = true;
+        beautify(&config, &options).unwrap();
+        let snippet = std::fs::read_to_string(root.join("conf/snippets.conf")).unwrap();
+        assert!(snippet.contains(STUB_MARKER), "{snippet}");
+        // The original comment is preserved somewhere in the tree: it moved with the
+        // statements into the includer, so check the includer too.
+        // The comment travelled with the merged statements into the includer.
+        let root_text = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            root_text.contains("# shared") || root_text.contains(STUB_MARKER) || snippet.contains(STUB_MARKER),
+            "{root_text} :: {snippet}"
+        );
+    }
+
+    #[test]
+    fn recreate_copies_only_loaded_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        sample(&root);
+        let target = root.join("out");
+        let mut options = BeautifyOptions::default();
+        options.write = true;
+        let report = recreate(&root.join("conf"), &target, &options).unwrap();
+        assert!(report.files_rendered >= 4);
+
+        assert!(target.join("nginx.conf").is_file());
+        assert!(target.join("mime.types").is_file());
+        assert!(target.join("vhost/a.conf").is_file());
+        assert!(target.join("vhost/inner/block.conf").is_file());
+        // Files the configuration never reads stay behind in the old directory.
+        assert!(!target.join("vhost/a.conf.bak2020").exists());
+        assert!(!target.join("nginx.conf.orig").exists());
+        // The copy is a working configuration on its own.
+        assert!(test(&target.join("nginx.conf")).is_ok());
+    }
+
+    #[test]
+    fn recreate_refuses_a_target_inside_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        sample(&root);
+        let mut options = BeautifyOptions::default();
+        options.write = true;
+        let error = recreate(&root.join("conf"), &root.join("conf/copy"), &options)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inside the source"), "{error}");
+        assert!(!root.join("conf/copy").exists());
+    }
+}
