@@ -117,4 +117,8 @@ MD5 与 `levels` 分级存放（`ngx_http_file_cache_name`），`$upstream_cache
 `proxy_buffering off` 逐块转发。`proxy_limit_rate` 限制发往客户端的速率。
 `proxy_store`/`proxy_store_access` 仍会解析并校验，但不会落盘（缓存域尚未实现）。
 
+默认值对齐 nginx 1.29.7+：`proxy_http_version 1.1`（`1.0`/`1.1`/`2` 均可选）、`proxy_buffers 8 <pagesize>`、
+`proxy_buffer_size <pagesize>`；`proxy_buffers` 少于 2 个缓冲区会在 `-t` 阶段报错（同 C 实现）。
+请求发往上游时按 `ngx_http_proxy_headers` 清除 `Connection`/`Keep-Alive`/`Proxy-Connection`/`TE`/
+`Upgrade`/`Expect`，再按默认 `proxy_set_header Connection close` 补上，`proxy_set_header` 可覆盖。
 

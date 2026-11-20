@@ -355,6 +355,8 @@ cargo clippy --all-targets -- -D warnings
 - `ssl_stapling_verify on`：伪造的 OCSP 响应会让 `-t` 失败；
 - `listen ... http2`：客户端只提供 `h2` 时 ALPN 协商成功且服务端以 SETTINGS 帧应答；
 - `-s stop`：进程真正退出并关闭监听端口；`listen`/`upstream server` 接受主机名；
+- `proxy_http_version` 默认 1.1、`proxy_buffers` 默认 8×pagesize 且至少 2 个缓冲区；
+- 发往上游时清除 `Connection`/`Keep-Alive`/`TE`/`Upgrade`/`Expect`，默认补 `Connection: close`；
 - `ssl_early_data on`：TLS 1.3 下客户端可尝试 0-RTT，`$ssl_early_data` 反映实际结果。
 - `proxy_next_upstream`：`http_503` 触发重试并最终由健康节点应答、默认 `error timeout` 不对状态码重试、
   连接失败默认重试、`off` 关闭重试、`proxy_next_upstream_tries 1` 限制尝试次数、

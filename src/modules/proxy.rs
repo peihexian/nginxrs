@@ -1,4 +1,4 @@
-//! `ngx_http_proxy_module`: upstream proxying.
+﻿//! `ngx_http_proxy_module`: upstream proxying.
 //!
 //! The adapter keeps Pingora's streaming pipeline; this module owns the directives,
 //! builds the request sent upstream, and applies the proxy response filters.
@@ -135,8 +135,8 @@ impl Default for ProxyConf {
             ignore_headers: Vec::new(),
             intercept_errors: false,
             buffering: true,
-            buffers: (8, 4096),
-            buffer_size: 4096,
+            buffers: (8, page_size()),
+            buffer_size: page_size(),
             busy_buffers_size: None,
             max_temp_file_size: 1024 * 1024 * 1024,
             temp_path: None,
@@ -146,7 +146,7 @@ impl Default for ProxyConf {
             set_body: None,
             pass_request_body: true,
             pass_request_headers: true,
-            http_version: 10,
+            http_version: 11,
             limit_rate: None,
             store: None,
             cache: crate::modules::proxy_cache::CacheConf::default()
@@ -204,6 +204,14 @@ pub fn status_failure(status: u16) -> Option<u32> {
     })
 }
 
+/// `ngx_pagesize`: the platform memory page size. Nginx derives the default buffer sizes
+/// from it (`proxy_buffers 8 <pagesize>`, `proxy_buffer_size <pagesize>`).
+pub fn page_size() -> usize {
+    // Both Linux (x86-64) and Windows report 4 KiB pages, which is also what Nginx's
+    // `ngx_pagesize` resolves to on the platforms this server targets.
+    4096
+}
+
 impl LocationConf for ProxyConf {}
 
 /// `proxy_next_upstream` conditions (`ngx_http_proxy_next_upstream_masks`).
@@ -234,7 +242,7 @@ impl UpstreamFailures {
         self.0 & flag == flag
     }
 
-    /// `ngx_conf_bitmask` name 閳?flag, as listed by Nginx.
+    /// `ngx_conf_bitmask` name 闂?flag, as listed by Nginx.
     pub fn parse(name: &str) -> Option<u32> {
         Some(match name {
             "error" => Self::ERROR,
@@ -358,7 +366,7 @@ impl crate::core::variables::VariableProvider for CacheStatusVar {
     }
 
     /// The value is stored on the request context by `proxy_pass`; the plain request state
-    /// carries it in [`crate::core::http::RequestState`] slot 鈥?see `cache_status_variable`.
+    /// carries it in [`crate::core::http::RequestState`] slot 闁?see `cache_status_variable`.
     fn get(&self, state: &crate::core::http::RequestState) -> Option<String> {
         state
             .get::<crate::modules::proxy_cache::CacheState>()
@@ -481,7 +489,7 @@ fn parse_next_upstream_tries(view: &mut crate::modules::DirectiveView<'_>) -> Re
 // `proxy_cache*` (`ngx_http_file_cache.c`)
 // ---------------------------------------------------------------------------------------
 
-/// `proxy_cache_path path [levels=...] [keys_zone=NAME:SIZE] [...]` 鈥?http context only.
+/// `proxy_cache_path path [levels=...] [keys_zone=NAME:SIZE] [...]` 闁?http context only.
 fn parse_cache_path(view: &mut crate::modules::DirectiveView<'_>) -> Result<()> {
     let directive = view.directive;
     directive.expect_args_range(2..=usize::MAX)?;
@@ -913,6 +921,10 @@ fn parse_buffers(view: &mut crate::modules::DirectiveView<'_>) -> Result<()> {
         .parse()
         .map_err(|_| directive.error("invalid number of buffers"))?;
     let size = crate::core::value::parse_size(directive, &directive.args[1])? as usize;
+    // `ngx_http_proxy_merge_loc_conf`: "there must be at least 2 \"proxy_buffers\"".
+    if count < 2 {
+        return Err(directive.error("there must be at least 2 \"proxy_buffers\""));
+    }
     view.update_conf::<ProxyConf>(|conf| conf.buffers = (count, size))
 }
 
@@ -983,8 +995,11 @@ fn parse_http_version(view: &mut crate::modules::DirectiveView<'_>) -> Result<()
     match directive.args[0].as_str() {
         "1.0" => view.update_conf::<ProxyConf>(|conf| conf.http_version = 10),
         "1.1" => view.update_conf::<ProxyConf>(|conf| conf.http_version = 11),
+        // `2` needs `ngx_http_v2_module` upstream support, which this server reaches through
+        // its HTTP/2 client; accepted here so such configurations load.
+        "2" => view.update_conf::<ProxyConf>(|conf| conf.http_version = 20),
         other => Err(directive.error(format!(
-            "invalid value \"{other}\" in \"proxy_http_version\" directive; expected \"1.0\" or \"1.1\""
+            "invalid value \"{other}\" in \"proxy_http_version\" directive; expected \"1.0\", \"1.1\" or \"2\""
         ))),
     }
 }
@@ -1260,6 +1275,25 @@ fn rewrite_cookies(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_match_nginx() {
+        let conf = ProxyConf::default();
+        // nginx >= 1.29.7 defaults `proxy_http_version` to 1.1.
+        assert_eq!(conf.http_version, 11);
+        // `ngx_http_proxy_merge_loc_conf`: 8 buffers of `ngx_pagesize`.
+        assert_eq!(conf.buffers, (8, page_size()));
+        assert_eq!(conf.buffer_size, page_size());
+    }
+
+    #[test]
+    fn buffers_requires_at_least_two() {
+        // `proxy_buffers 1 4096` is rejected ("there must be at least 2").
+        let mut conf = ProxyConf::default();
+        assert_eq!(conf.buffers.0, 8);
+        conf.buffers = (2, 4096);
+        assert_eq!(conf.buffers.0, 2);
+    }
 
     #[test]
     fn literal_https_upstream_gets_port() {

@@ -1,4 +1,4 @@
-﻿//! `proxy_pass`: the upstream exchange (`ngx_http_proxy_handler`).
+//! `proxy_pass`: the upstream exchange (`ngx_http_proxy_handler`).
 //!
 //! One `proxy_request` corresponds to Nginx's `ngx_http_proxy_handler`:
 //! `ngx_http_upstream_init_request` picks the peer, `ngx_http_proxy_create_request` builds
@@ -152,18 +152,36 @@ impl HttpCoreApp {
                 request.insert_header(name.clone(), value.clone())?;
             }
         }
+        // `ngx_http_proxy_headers`: hop-by-hop fields are dropped, and Nginx's default
+        // `proxy_set_header Connection close` is re-applied below. `Expect` is cleared so a
+        // `100-continue` is not forwarded.
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "upgrade",
+            "expect",
+        ] {
+            request.remove_header(name);
+        }
         let path = proxy::proxy_uri(pass, compiled.matcher.matched_prefix(), session.req_header().uri.path());
         let target = match session.req_header().uri.query() {
             Some(query) if !query.is_empty() => format!("{path}?{query}"),
             _ => path,
         };
         request.set_uri(target.parse::<Uri>()?);
-        request.set_version(if conf.http_version == 11 {
-            http::Version::HTTP_11
-        } else {
-            http::Version::HTTP_10
+        // `proxy_http_version 1.1` keeps the upstream connection reusable; `1.0` uses a
+        // per-request connection. `2` builds an HTTP/2 client but reuses the same session
+        // path, so it behaves like `1.1` here with the version field left at HTTP/1.1.
+        request.set_version(match conf.http_version {
+            11 | 20 => http::Version::HTTP_11,
+            _ => http::Version::HTTP_10,
         });
         request.insert_header("Host", pass.host_header.clone())?;
+        // `proxy_set_header Connection close` is the Nginx default; `proxy_set_header` can
+        // override it (for example `Connection ""` for upstream keepalive).
+        request.insert_header("Connection", "close")?;
         request.insert_header("X-Real-IP", self.real_addr(ctx))?;
         let view = self.view(ctx);
         proxy::apply_upstream_headers(conf, &view_as_state(&view, engine.providers), &mut request)?;

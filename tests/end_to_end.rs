@@ -284,6 +284,24 @@ fn spawn_echo_backend() -> u16 {
                 .map(|line| line.to_ascii_lowercase())
                 .collect::<Vec<_>>()
                 .join("\n");
+            // Drain the announced body (`proxy_set_body` may send one): closing while the
+            // proxy is still writing makes its write fail and yields a 502.
+            if let Some(length) = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:").map(str::trim))
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                let mut body = Vec::new();
+                while body.len() < length {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => body.extend_from_slice(&buffer[..count]),
+                        Err(_) => break,
+                    }
+                }
+            }
+            // `Connection: close` keeps each exchange independent: the proxy may reuse a
+            // keep-alive upstream connection, and this backend serves one request per socket.
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{headers}",
                 headers.len()
@@ -1627,7 +1645,7 @@ fn proxy_max_temp_file_size_zero_still_serves_the_body() {
                 listen 127.0.0.1:{port};
                 location / {{
                     proxy_pass http://backend;
-                    proxy_buffers 1 1024;
+                    proxy_buffers 2 1024;
                     proxy_max_temp_file_size 0;
                     proxy_temp_path {temp_dir};
                 }}
@@ -2804,5 +2822,199 @@ fn x_accel_headers_are_not_forwarded() {
     assert!(
         !response.to_lowercase().contains("x-accel-expires"),
         "X-Accel-* must not reach the client: {response}"
+    );
+}
+
+/// `ngx_http_proxy_headers`: hop-by-hop fields are cleared by default.
+#[test]
+fn connection_header_is_not_forwarded_upstream() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let backend = spawn_echo_backend();
+    let config = format!(
+        r#"
+        http {{
+            access_log off;
+            upstream backend {{ server 127.0.0.1:{backend}; }}
+            server {{
+                listen 127.0.0.1:{port};
+                location / {{ proxy_pass http://backend/; }}
+            }}
+        }}
+        "#
+    );
+    let _server = start(&config, port, temp.path());
+    let response = request(
+        port,
+        "GET /x HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\r\n",
+    );
+    assert_eq!(status(&response), 200, "{response}");
+    let echoed = body(&response);
+    assert!(
+        !echoed.contains("keep-alive: timeout"),
+        "Keep-Alive must not reach the upstream: {echoed}"
+    );
+    // `proxy_set_header Connection close` is the Nginx default, so the client''s
+    // `keep-alive` must be replaced rather than forwarded.
+    assert!(
+        echoed.contains("connection: close"),
+        "the default Connection: close must be sent: {echoed}"
+    );
+    assert!(
+        !echoed.contains("connection: keep-alive"),
+        "the client Connection must not be forwarded: {echoed}"
+    );
+}
+
+/// `proxy_http_version 1.1` (the default) sends an HTTP/1.1 request line upstream.
+#[test]
+fn proxy_http_version_defaults_to_1_1() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let seen: &'static std::sync::Mutex<String> = Box::leak(Box::new(std::sync::Mutex::new(String::new())));
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => request.extend_from_slice(&buffer[..count]),
+                    Err(_) => break,
+                }
+            }
+            let text = String::from_utf8_lossy(&request).to_string();
+            *seen.lock().unwrap() = text.lines().next().unwrap_or("").to_string();
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let config = format!(
+        r#"
+        http {{
+            access_log off;
+            upstream backend {{ server 127.0.0.1:{backend_port}; }}
+            server {{
+                listen 127.0.0.1:{port};
+                location / {{ proxy_pass http://backend/; }}
+            }}
+        }}
+        "#
+    );
+    let _server = start(&config, port, temp.path());
+    let response = request(
+        port,
+        "GET /x HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), 200, "{response}");
+    let request_line = seen.lock().unwrap().clone();
+    assert!(
+        request_line.ends_with("HTTP/1.1"),
+        "the upstream request line must be HTTP/1.1 by default: {request_line}"
+    );
+}
+
+/// `proxy_http_version 1.0` is still available and switches the request line.
+#[test]
+fn proxy_http_version_1_0_is_honoured() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let seen: &'static std::sync::Mutex<String> = Box::leak(Box::new(std::sync::Mutex::new(String::new())));
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => request.extend_from_slice(&buffer[..count]),
+                    Err(_) => break,
+                }
+            }
+            let text = String::from_utf8_lossy(&request).to_string();
+            *seen.lock().unwrap() = text.lines().next().unwrap_or("").to_string();
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let config = format!(
+        r#"
+        http {{
+            access_log off;
+            upstream backend {{ server 127.0.0.1:{backend_port}; }}
+            server {{
+                listen 127.0.0.1:{port};
+                location / {{
+                    proxy_pass http://backend/;
+                    proxy_http_version 1.0;
+                }}
+            }}
+        }}
+        "#
+    );
+    let _server = start(&config, port, temp.path());
+    let response = request(
+        port,
+        "GET /x HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), 200, "{response}");
+    let request_line = seen.lock().unwrap().clone();
+    assert!(
+        request_line.ends_with("HTTP/1.0"),
+        "proxy_http_version 1.0 must be honoured: {request_line}"
+    );
+}
+
+/// `proxy_buffers 1` is rejected like Nginx ("there must be at least 2").
+#[test]
+fn proxy_buffers_requires_two_buffers() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("nginx.conf");
+    std::fs::write(
+        &path,
+        r#"
+        http {
+            server {
+                listen 127.0.0.1:18096;
+                location / {
+                    proxy_pass http://127.0.0.1:9000;
+                    proxy_buffers 1 4096;
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_nginxrs"))
+        .arg("-c")
+        .arg(&path)
+        .arg("-t")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        message.contains("at least 2") && message.contains("proxy_buffers"),
+        "{message}"
     );
 }
