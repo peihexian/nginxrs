@@ -1064,14 +1064,17 @@ const DEFAULT_HIDDEN: &[&str] = &[
     "keep-alive",
 ];
 
+/// Whether `proxy_pass_header` re-enables `name`.
+pub fn passes_through(conf: &ProxyConf, name: &str) -> bool {
+    conf.pass_headers
+        .iter()
+        .any(|passed| passed.eq_ignore_ascii_case(name))
+}
+
 /// `ngx_http_upstream_hide_headers`: apply the default hidden set, the `X-Accel-*` control
 /// fields and `proxy_hide_header`; `proxy_pass_header` re-enables any of them.
 pub fn apply_response_headers(conf: &ProxyConf, response: &mut ResponseHeader) {
-    let passed = |name: &str| {
-        conf.pass_headers
-            .iter()
-            .any(|passed| passed.eq_ignore_ascii_case(name))
-    };
+    let passed = |name: &str| passes_through(conf, name);
     for name in DEFAULT_HIDDEN {
         if !passed(name) {
             response.remove_header(*name);
