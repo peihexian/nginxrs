@@ -3,3 +3,4 @@
 *.pid
 /c
 /test_conf
+/tmp_v

@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nginxrs::config::Config;
 use nginxrs::core::http_core::Engine;
+use nginxrs::core::maintain::BeautifyOptions;
 use nginxrs::core::reload::{self, Reloader};
 use nginxrs::modules::balancer::Upstream;
 use nginxrs::modules::log::{AccessLogConfig, AccessLogWriter, LogTarget};
@@ -30,6 +31,28 @@ struct Cli {
     #[arg(short = 't', long = "test")]
     test: bool,
 
+    /// Beautify the configuration: reformat the file and every file it includes, keep the
+    /// comments, then validate the result. Use with `-w`.
+    #[arg(short = 'b', long = "beautify")]
+    beautify: bool,
+
+    /// Write the files changed by `-b` (without `-w` nothing is written).
+    #[arg(short = 'w', long = "write")]
+    write: bool,
+
+    /// Indentation step for `-b` and `-r`: a number of spaces (default 4) or `t` for one tab.
+    #[arg(long = "indent", value_name = "STYLE")]
+    indent: Option<String>,
+
+    /// Recreate a clean configuration directory: copy only the configuration files the
+    /// running configuration loads from the source directory into the new directory.
+    #[arg(short = 'r', long = "recreate", value_names = ["SOURCE", "TARGET"])]
+    recreate: Option<Vec<PathBuf>>,
+
+    /// Dump the configuration and every included file to the standard output.
+    #[arg(short = 'T', long = "dump")]
+    dump: bool,
+
     /// Send a signal to a running instance: `reload` (like nginx -s reload) or `stop`.
     #[arg(short = 's', long = "signal")]
     signal: Option<String>,
@@ -44,6 +67,16 @@ fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
     let cli = Cli::parse();
+
+    let options = nginxrs::core::maintain::BeautifyOptions {
+        indent: cli
+            .indent
+            .as_deref()
+            .map(nginxrs::core::layout::IndentStyle::from_spec)
+            .unwrap_or_default(),
+        write: cli.write,
+        verbose: true,
+    };
 
     if let Some(signal) = &cli.signal {
         let pid_file = cli
@@ -63,6 +96,24 @@ fn main() -> Result<()> {
             }
             other => bail!("unknown signal \"{other}\"; expected reload or stop"),
         };
+    }
+
+    if cli.beautify {
+        return run_beautify(&cli.config, &options);
+    }
+
+    if let Some(targets) = &cli.recreate {
+        if targets.len() != 2 {
+            bail!("-r/--recreate needs two paths: <source-directory> <new-directory>");
+        }
+        return run_recreate(&targets[0], &targets[1], &options);
+    }
+
+    if cli.dump {
+        print!("{}", nginxrs::commands::dump(&cli.config)?);
+        if !cli.test {
+            return Ok(());
+        }
     }
 
     let config = Config::load(&cli.config)
@@ -274,6 +325,52 @@ fn default_pid_file(config: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("nginxrs.pid"))
 }
 
+/// `-b`: beautify the configuration, then validate the beautified files.
+fn run_beautify(config: &Path, options: &BeautifyOptions) -> Result<()> {
+    let report = nginxrs::commands::beautify(config, options)?;
+    print_report(&report);
+    if !options.write && !report.changed.is_empty() {
+        println!(
+            "nginxrs: {} file(s) would change; run with -w to write them",
+            report.changed.len()
+        );
+    }
+    // `-b` always validates the result, whether or not it was written: the rendered text was
+    // already parsed and compared to the original configuration before reaching this point.
+    println!(
+        "nginxrs: beautified configuration {} syntax is ok",
+        config.display()
+    );
+    Ok(())
+}
+
+/// `-r`: copy the effective configuration into a new directory, then validate it there.
+fn run_recreate(source: &Path, target: &Path, options: &BeautifyOptions) -> Result<()> {
+    let mut options = options.clone();
+    // `-r` always writes; the new directory is the point of the command.
+    options.write = true;
+    let report = nginxrs::commands::recreate(source, target, &options)?;
+    print_report(&report);
+    println!(
+        "nginxrs: recreated configuration {} syntax is ok",
+        target.display()
+    );
+    Ok(())
+}
+
+fn print_report(report: &nginxrs::core::maintain::Report) {
+    for note in &report.notes {
+        println!("nginxrs: {note}");
+    }
+    if !report.stubs.is_empty() {
+        println!(
+            "nginxrs: {} file(s) hold #vhosts-conf# markers for directives merged from \
+             an included file",
+            report.stubs.len()
+        );
+    }
+}
+
 #[cfg(unix)]
 fn spawn_sighup_watcher(reloader: Arc<Reloader>) {
     std::thread::spawn(move || {
@@ -300,3 +397,5 @@ fn spawn_sighup_watcher(reloader: Arc<Reloader>) {
 fn spawn_sighup_watcher(_reloader: Arc<Reloader>) {
     // Windows has no SIGHUP; `nginxrs -s reload` drives the same code path.
 }
+
+

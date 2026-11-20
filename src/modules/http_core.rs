@@ -94,6 +94,26 @@ fn spec(
     }
 }
 
+/// The directive contexts a configuration statement may appear in, judged by its name.
+///
+/// This is the same table [`Registry::resolve`] uses for `-t`, so a statement that `-t`
+/// accepts gets one row here for every context that accepts it. Structural directives
+/// (`http`, `server`, `location`, ...) are compiled by [`HttpCompiler`] and are listed too,
+/// because they carry their own block.
+pub fn contexts_for(registry: &Registry, name: &str) -> Vec<Context> {
+    [
+        Context::Main,
+        Context::Events,
+        Context::Http,
+        Context::Server,
+        Context::Location,
+        Context::Upstream,
+    ]
+    .into_iter()
+    .filter(|context| registry.resolve(name, *context).is_some())
+    .collect()
+}
+
 /// Marker stating that a directive must be handled by the compiler itself.
 fn dispatch_to_compiler(_: &mut crate::modules::DirectiveView<'_>) -> Result<()> {
     unreachable!(

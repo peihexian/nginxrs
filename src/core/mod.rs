@@ -2,8 +2,11 @@
 
 pub mod http;
 pub mod http_core;
+pub mod layout;
+pub mod maintain;
 pub mod reload;
 pub mod runner;
+pub mod source;
 pub mod state;
 pub mod syntax;
 pub mod tls;
@@ -108,3 +111,5 @@ pub struct DirectiveSpec {
     pub contexts: &'static [Context],
     pub handler: fn(&mut crate::modules::registry::DirectiveView<'_>) -> anyhow::Result<()>,
 }
+
+

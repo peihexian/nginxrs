@@ -24,8 +24,10 @@
 //! [`modules::registry::Registry::default_modules`], and using it from the phase engine
 //! only through the configuration it places in [`modules::location::Location`].
 
+pub mod commands;
 pub mod config;
 pub mod core;
 pub mod modules;
 
 pub const SERVER_NAME: &str = concat!("nginxrs/", env!("CARGO_PKG_VERSION"));
+

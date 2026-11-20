@@ -156,6 +156,17 @@ pub fn parse_str(source: &str) -> Result<Vec<Directive>> {
     .parse(false)
 }
 
+/// Parse source text as if it had been read from `path`: every directive records that
+/// path, so diagnostics and include resolution match [`parse_file`] exactly.
+pub fn parse_source_with_path(source: &str, path: &Path) -> Result<Vec<Directive>> {
+    Parser {
+        tokens: lex(source)?,
+        offset: 0,
+        file: path.to_path_buf(),
+    }
+    .parse(false)
+}
+
 struct Parser {
     tokens: Vec<Token>,
     offset: usize,
