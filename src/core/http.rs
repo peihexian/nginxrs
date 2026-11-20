@@ -177,6 +177,10 @@ impl RequestState {
                 .to_string(),
             "request_method" => self.request.method.to_string(),
             "scheme" => self.connection.scheme.clone(),
+            // `$proxy_host`/`$proxy_port` come from `ngx_http_proxy_module` and default to
+            // the request `Host`; they appear in the default `proxy_cache_key`.
+            "proxy_host" => self.request.host.clone(),
+            "proxy_port" => self.connection.local_port.to_string(),
             "https" => if self.connection.tls { "on" } else { "" }.to_string(),
             "server_name" => self.server_name.clone(),
             "server_addr" => self
@@ -302,6 +306,10 @@ impl RequestState {
             upstream_addr: self.upstream_addr.clone(),
             body_bytes_sent: self.body_bytes_sent,
             limit_req_status: self.limit_req_status().map(|status| status.as_str()),
+            cache_status: self
+                .get::<crate::modules::proxy_cache::CacheState>()
+                .and_then(|cache| cache.status)
+                .map(|status| status.as_str()),
         }
     }
 }
@@ -319,6 +327,8 @@ pub struct RequestStateView {
     pub upstream_addr: String,
     pub body_bytes_sent: usize,
     pub limit_req_status: Option<&'static str>,
+    /// `$upstream_cache_status` captured from the proxy exchange.
+    pub cache_status: Option<&'static str>,
 }
 
 impl RequestStateView {
@@ -387,7 +397,12 @@ impl RequestStateView {
     /// Resolve a variable. Module providers are not consulted for snapshots; the
     /// `realip_*` variables are built in and therefore always available.
     pub fn variable(&self, name: &str) -> Option<String> {
-        self.builtin_variable(name)
+        match name {
+            // `$upstream_cache_status` is kept in the snapshot because the cache decision
+            // happens after the header filter needs the value.
+            "upstream_cache_status" => Some(self.cache_status.unwrap_or_default().to_string()),
+            _ => self.builtin_variable(name),
+        }
     }
 
     /// Rebuild a full request state (used when a filter needs module variables).
@@ -398,7 +413,7 @@ impl RequestStateView {
             &'static dyn crate::core::variables::VariableProvider,
         )],
     ) -> RequestState {
-        RequestState {
+        let mut state = RequestState {
             connection: self.connection,
             client: self.client,
             request: self.request,
@@ -410,7 +425,24 @@ impl RequestStateView {
             upstream_addr: self.upstream_addr,
             providers,
             slots: HashMap::new(),
+        };
+        if let Some(cache_status) = self.cache_status {
+            let status = match cache_status {
+                "HIT" => crate::modules::proxy_cache::CacheStatus::Hit,
+                "MISS" => crate::modules::proxy_cache::CacheStatus::Miss,
+                "BYPASS" => crate::modules::proxy_cache::CacheStatus::Bypass,
+                "EXPIRED" => crate::modules::proxy_cache::CacheStatus::Expired,
+                "STALE" => crate::modules::proxy_cache::CacheStatus::Stale,
+                "UPDATING" => crate::modules::proxy_cache::CacheStatus::Updating,
+                "REVALIDATED" => crate::modules::proxy_cache::CacheStatus::Revalidated,
+                _ => crate::modules::proxy_cache::CacheStatus::Scarce,
+            };
+            state.insert(crate::modules::proxy_cache::CacheState {
+                status: Some(status),
+                ..Default::default()
+            });
         }
+        state
     }
 }
 

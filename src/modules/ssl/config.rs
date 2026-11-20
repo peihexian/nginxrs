@@ -448,6 +448,9 @@ pub struct TlsVirtualServer {
     pub index: usize,
     pub server_names: Vec<String>,
     pub config: Arc<ServerConfig>,
+    /// `ssl_reject_handshake on`: answer with `unrecognized_name` instead of a certificate
+    /// (`ngx_http_ssl_servername`, `handshake_rejected`).
+    pub reject_handshake: bool,
 }
 
 /// All TLS virtual servers bound to one listener address.

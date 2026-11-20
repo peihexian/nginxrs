@@ -31,6 +31,8 @@ pub struct DownstreamTls {
     pub facts: Arc<SslSession>,
     /// `server {}` selected by SNI (`ngx_http_ssl_servername`).
     pub server_index: usize,
+    /// Bytes returned by `peek` that the next read must replay.
+    peeked: Vec<u8>,
 }
 
 impl DownstreamTls {
@@ -40,7 +42,7 @@ impl DownstreamTls {
     }
 
     fn session(&self) -> &rustls::ServerConnection {
-        &self.inner.get_ref().1
+        self.inner.get_ref().1
     }
 }
 
@@ -61,6 +63,13 @@ impl AsyncRead for DownstreamTls {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Replay bytes handed out by `try_peek` before reading more TLS records.
+        if !self.peeked.is_empty() {
+            let count = self.peeked.len().min(buf.remaining());
+            buf.put_slice(&self.peeked[..count]);
+            self.peeked.drain(..count);
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -178,7 +187,20 @@ impl GetSocketDigest for DownstreamTls {
     }
 }
 
-impl Peek for DownstreamTls {}
+#[async_trait::async_trait]
+impl Peek for DownstreamTls {
+    /// Peek the first bytes of the next HTTP request without consuming them, matching
+    /// `ngx_http_wait_request_handler`'s look at the request line for h2c detection.
+    async fn try_peek(&mut self, buf: &mut [u8]) -> std::io::Result<bool> {
+        use tokio::io::AsyncReadExt;
+        let count = self.inner.read(buf).await?;
+        if count == 0 {
+            return Ok(false);
+        }
+        self.peeked = buf[..count].to_vec();
+        Ok(true)
+    }
+}
 
 /// Perform the TLS handshake for one accepted downstream connection.
 ///
@@ -195,6 +217,15 @@ pub async fn accept(
         Err(_) => bail!("ssl_handshake_timeout"),
     };
     let sni = start.client_hello().server_name().map(str::to_string);
+    // `ngx_http_ssl_servername` tail: a server with `ssl_reject_handshake on` answers the
+    // handshake with `unrecognized_name` instead of presenting a certificate.
+    if tls
+        .hosts
+        .select(sni.as_deref())
+        .reject_handshake
+    {
+        bail!("ssl_reject_handshake: unrecognized_name");
+    }
     let (index, config) = tls.hosts.resolve(sni.as_deref());
     let negotiated = config.clone();
     let stream = match tokio::time::timeout(deadline, start.into_stream(config)).await {
@@ -208,6 +239,7 @@ pub async fn accept(
         inner: stream,
         facts,
         server_index: index,
+        peeked: Vec::new(),
     })
 }
 

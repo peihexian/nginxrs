@@ -2,7 +2,7 @@
 
 use crate::core::syntax::Directive;
 use anyhow::Result;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -109,24 +109,61 @@ pub fn parse_status(node: &Directive, value: &str) -> Result<u16> {
     }
 }
 
-/// Parse `address[:port]` for a `listen` directive and require a numeric address.
+/// Parse `address[:port]` for a `listen` directive.
+///
+/// A hostname is resolved with `getaddrinfo` (`ngx_inet_resolve_host`); the first resolved
+/// address is used, as Nginx does when it binds a `listen` with a name.
 pub fn parse_listen_address(node: &Directive, value: &str) -> Result<String> {
     let address = normalize_address(value, 80);
-    address.parse::<SocketAddr>().map_err(|_| {
-        node.error(format!(
-            "listen currently requires a numeric IP address, got {address}"
-        ))
-    })?;
-    Ok(address)
+    if address.parse::<SocketAddr>().is_ok() {
+        return Ok(address);
+    }
+    resolve_address(node, &address, 80)
+        .map_err(|error| node.error(format!("listen \"{value}\": {error}")))
 }
 
-/// Parse an upstream `host:port` and require a numeric address.
+/// Parse an upstream `host:port`, resolving a hostname like `ngx_inet_resolve_host`.
 pub fn parse_upstream_address(node: &Directive, value: &str) -> Result<String> {
     let address = normalize_address(value, 80);
-    address.parse::<SocketAddr>().map_err(|_| {
-        node.error("upstream server currently requires a numeric IP address and port")
-    })?;
-    Ok(address)
+    if address.parse::<SocketAddr>().is_ok() {
+        return Ok(address);
+    }
+    resolve_address(node, &address, 80)
+        .map_err(|error| node.error(format!("upstream server \"{value}\": {error}")))
+}
+
+/// Resolve `host:port` through `getaddrinfo` and return the first address.
+fn resolve_address(node: &Directive, address: &str, default_port: u16) -> Result<String> {
+    // Split the host from the port the same way `normalize_address` composed it.
+    let (host, port) = split_host_port(address, default_port);
+    let resolved: Vec<SocketAddr> = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|_| anyhow::anyhow!("host \"{host}\" not found"))?
+        .collect();
+    resolved
+        .first()
+        .map(|resolved| resolved.to_string())
+        .ok_or_else(|| {
+            let _ = node;
+            anyhow::anyhow!("host \"{host}\" not found")
+        })
+}
+
+/// Split a normalized `address[:port]` into host and port.
+fn split_host_port(address: &str, default_port: u16) -> (String, u16) {
+    if let Some(rest) = address.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once("]:") {
+            return (host.to_string(), tail.parse().unwrap_or(default_port));
+        }
+        return (rest.trim_end_matches(']').to_string(), default_port);
+    }
+    match address.rsplit_once(':') {
+        Some((host, port)) => (
+            host.to_string(),
+            port.parse().unwrap_or(default_port),
+        ),
+        None => (address.to_string(), default_port),
+    }
 }
 
 pub fn parse_ip(node: &Directive, value: &str) -> Result<IpAddr> {
@@ -198,6 +235,23 @@ mod tests {
     fn rejects_bad_values() {
         assert!(parse_time(&node(), "abc").is_err());
         assert!(parse_size(&node(), "10x").is_err());
+    }
+
+    #[test]
+    fn hostnames_resolve_to_an_address() {
+        // `ngx_inet_resolve_host`: a name is resolved through `getaddrinfo`.
+        let resolved = parse_listen_address(&node(), "localhost:8080").unwrap();
+        assert!(resolved.contains(":8080"), "{resolved}");
+        assert!(
+            resolved.starts_with("127.0.0.1") || resolved.starts_with("[::1]"),
+            "{resolved}"
+        );
+
+        let upstream = parse_upstream_address(&node(), "localhost:9000").unwrap();
+        assert!(upstream.contains(":9000"), "{upstream}");
+
+        // A name which does not exist is a configuration error.
+        assert!(parse_listen_address(&node(), "no-such-host.invalid:80").is_err());
     }
 
     #[test]

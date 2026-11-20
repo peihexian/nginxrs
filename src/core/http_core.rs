@@ -26,15 +26,51 @@ use crate::modules::static_files::{self, StaticConf};
 use crate::modules::uri;
 use crate::modules::writer::ResponseWriter;
 use arc_swap::ArcSwap;
+use pingora_core::server::ShutdownWatch;
+
+/// ssl_handshake_timeout default in Nginx.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 use async_trait::async_trait;
 use http::{StatusCode, Uri};
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::connectors::TransportConnector;
+use pingora_core::upstreams::peer::{HttpPeer, PeerOptions};
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
+
+/// Retry state shared between `proxy_pass` and one upstream attempt
+/// (`ngx_http_upstream_next`).
+#[derive(Clone, Copy)]
+struct RetryBudget {
+    remaining: usize,
+    mask: crate::modules::proxy::UpstreamFailures,
+    timeout: Option<std::time::Duration>,
+    started: std::time::Instant,
+    non_idempotent: bool,
+}
+
+impl RetryBudget {
+    /// Whether one more attempt is allowed for `class` (`ngx_http_upstream_next`): the
+    /// condition must be enabled, an already-sent request is non-idempotent unless listed,
+    /// and `proxy_next_upstream_tries`/`_timeout` still have to allow it.
+    fn allows(&self, class: u32) -> bool {
+        use crate::modules::proxy::UpstreamFailures as F;
+        let mut effective = class;
+        if self.non_idempotent {
+            effective |= F::NON_IDEMPOTENT;
+        }
+        self.remaining > 0
+            && self.mask.contains(effective)
+            && self.mask.0 & F::OFF == 0
+            && self
+                .timeout
+                .map(|limit| self.started.elapsed() < limit)
+                .unwrap_or(true)
+    }
+}
 
 /// Everything the engine needs from the compiled configuration.
 pub struct Engine {
@@ -74,6 +110,32 @@ pub struct Selected {
     pub location: usize,
 }
 
+/// `$upstream_cache_status` shared between `proxy_pass` and the variable provider.
+#[derive(Clone, Debug, Default)]
+pub struct CacheStatusCell {
+    inner: Arc<parking_lot::RwLock<Option<crate::modules::proxy_cache::CacheState>>>,
+}
+
+impl CacheStatusCell {
+    pub fn set(&self, state: crate::modules::proxy_cache::CacheState) {
+        *self.inner.write() = Some(state);
+    }
+
+    /// The status name (`HIT`, `MISS`, ...) as a `'static` string for the variable view.
+    pub fn name(&self) -> Option<&'static str> {
+        let guard = self.inner.read();
+        guard.as_ref().and_then(|state| state.status).map(|status| status.as_str())
+    }
+
+    pub fn get(&self) -> Option<String> {
+        let guard = self.inner.read();
+        guard
+            .as_ref()
+            .and_then(|state| state.status)
+            .map(|status| status.as_str().to_string())
+    }
+}
+
 pub struct RequestContext {
     pub listen: String,
     pub request: RequestHeader,
@@ -92,6 +154,21 @@ pub struct RequestContext {
     pub ssl: Option<Arc<crate::modules::ssl::variables::SslSession>>,
     /// `server {}` selected by SNI at handshake time (`ngx_http_ssl_servername`).
     pub ssl_server: Option<usize>,
+    /// Status to report when every upstream attempt failed (`ngx_http_upstream_next`).
+    pub upstream_status: Option<StatusCode>,
+    /// `$upstream_cache_status`, filled in by `proxy_pass` (`ngx_http_upstream_cache_status`).
+    pub cache_status: CacheStatusCell,
+    /// Set when `proxy_cache_bypass` matched.
+    pub cache_bypassed: std::sync::atomic::AtomicBool,
+    /// A snapshot of the request's variables, used for cache key/bypass evaluation.
+    pub cache_state_source: Option<crate::core::http::RequestState>,
+    /// `error_page` already produced this response (recursion guard).
+    pub error_page_served: bool,
+    /// `=code` of the matching `error_page` entry.
+    pub error_page_status: Option<u16>,
+    /// Upstream response withheld by `proxy_intercept_errors` (status, body, headers).
+    #[allow(clippy::type_complexity)]
+    pub intercepted: Option<(u16, Vec<u8>, Vec<(String, String)>)>,
 }
 
 /// Result of the request phase engine (`ngx_http_core_run_phases`).
@@ -450,6 +527,7 @@ impl HttpCoreApp {
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         http: &HttpConfig,
         mut upstreams: HashMap<String, Arc<Upstream>>,
@@ -599,10 +677,76 @@ impl HttpCoreApp {
         body: &str,
         headers: &[(String, String)],
     ) -> Result<PhaseOutcome> {
+        // `ngx_http_special_response_handler`: an `error_page` entry for this status serves
+        // that URI instead of the generated body (`ngx_http_send_error_page`).
+        if status.as_u16() >= 300 && !ctx.error_page_served {
+            ctx.error_page_served = true;
+            if let Some(page) = self.error_page_for(ctx, status.as_u16()) {
+                let target = page.eval_uri(&self.view(ctx), self.engine.load().providers);
+                if self.error_page_location(ctx, &target).is_some() {
+                    // An internal redirect re-runs the whole phase stack for the new URI
+                    // (`ngx_http_internal_redirect`), so `return`, rewrite and content
+                    // handlers of the target location all apply.
+                    let previous = (state.request.path.clone(), state.request.args.clone());
+                    let previous_uri = session.req_header().uri.clone();
+                    crate::modules::uri::set_request_uri(
+                        &mut state.request,
+                        &target,
+                        page.args.as_deref(),
+                    );
+                    // `ngx_http_internal_redirect` rewrites `r->uri`/`r->args`; the phase
+                    // engine re-reads them from the request line.
+                    let redirect_uri = state.request.uri.clone();
+                    crate::modules::uri::set_uri(session.req_header_mut(), &redirect_uri).ok();
+                    ctx.error_page_status = page.overwrite;
+                    let outcome = Box::pin(self.route_request(session, ctx)).await;
+                    crate::modules::uri::set_uri(session.req_header_mut(), &previous_uri.to_string()).ok();
+                    state.request.path = previous.0;
+                    state.request.args = previous.1;
+                    return outcome;
+                }
+            }
+        }
         let _ = self.answer(session, state, ctx, status, body, headers).await;
         Ok(PhaseOutcome::Answered)
     }
 }
+
+impl HttpCoreApp {
+    /// The `error_page` entry of the selected location which answers `status`.
+    fn error_page_for(
+        &self,
+        ctx: &RequestContext,
+        status: u16,
+    ) -> Option<crate::modules::error_page::ErrorPage> {
+        let current = self.engine.load();
+        let compiled = current.location(ctx.selected?)?;
+        let conf = compiled
+            .conf
+            .get::<crate::modules::error_page::ErrorPageConf>()?;
+        let page = conf.find(status)?.clone();
+        // Only internal targets are implemented; an external URI would emit a redirect.
+        if !page.uri.source().starts_with('/') {
+            log::warn!(
+                "error_page {status} target \"{}\" is not an internal URI",
+                page.uri.source()
+            );
+            return None;
+        }
+        Some(page)
+    }
+
+    /// Resolve the server and location which serve the `error_page` target.
+    fn error_page_location(&self, ctx: &RequestContext, target: &str) -> Option<(usize, usize)> {
+        let current = self.engine.load();
+        let engine = &*current;
+        let server = engine.select_server(&ctx.listen, &ctx.host);
+        let server = server?;
+        let location = engine.select_location(server, target);
+        Some((server, location?))
+    }
+}
+
 
 impl HttpCoreApp {
     pub fn new(engine: Arc<ArcSwap<Engine>>, listen: String) -> Self {
@@ -650,6 +794,13 @@ impl HttpCoreApp {
             started: std::time::Instant::now(),
             ssl: None,
             ssl_server: None,
+            upstream_status: None,
+            cache_status: CacheStatusCell::default(),
+            cache_bypassed: std::sync::atomic::AtomicBool::new(false),
+            cache_state_source: None,
+            error_page_served: false,
+            error_page_status: None,
+            intercepted: None,
         }
     }
 
@@ -677,6 +828,869 @@ impl HttpCoreApp {
             message.as_deref(),
         );
     }
+
+    /// The `proxy_pass` content handler (`ngx_http_proxy_handler`).
+    ///
+    /// Chooses the peer (`ngx_http_upstream_init_request`), builds the upstream request
+    /// (`ngx_http_proxy_create_request`), forwards the body and relays the response. Returns
+    /// whether the downstream connection may be reused.
+    pub async fn proxy_request(&self, session: &mut Session, ctx: &mut RequestContext) -> bool {
+        let outcome = self.proxy_pass(session, ctx).await;
+        // `proxy_intercept_errors`: the withheld upstream response is processed like a local
+        // one, so `error_page` and the core's own error pages apply to it.
+        if let Some((status, body, headers)) = ctx.intercepted.take() {
+            let current = self.engine.load();
+            let providers = current.providers;
+            let text = String::from_utf8_lossy(&body).to_string();
+            let view = self.view(ctx);
+            let mut state = view_as_state(&view, providers);
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            if let Err(error) = self
+                .respond(&mut state, session, ctx, status, &text, &headers)
+                .await
+            {
+                log::error!("intercepted response failed: {error:#}");
+            }
+            return true;
+        }
+        match outcome {
+            Ok(keepalive) => keepalive,
+            Err(error) => {
+                log::error!("proxy_pass failed: {error:#}");
+                // `ngx_http_upstream_finalize_request`: report the upstream failure to the
+                // client instead of dropping the connection. A timed-out attempt yields 504,
+                // anything else 502 (see `UpstreamFailures::status`).
+                let status = ctx
+                    .upstream_status
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let (reason, body) = match status {
+                    StatusCode::GATEWAY_TIMEOUT => ("Gateway Time-out", "504 Gateway Time-out"),
+                    StatusCode::SERVICE_UNAVAILABLE => {
+                        ("Service Temporarily Unavailable", "503 Service Temporarily Unavailable")
+                    }
+                    _ => ("Bad Gateway", "502 Bad Gateway"),
+                };
+                let mut response = match ResponseHeader::build(status, Some(4)) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        log::error!("cannot build the upstream error response: {error}");
+                        return false;
+                    }
+                };
+                response.insert_header("Content-Type", "text/html").ok();
+                response
+                    .insert_header("Content-Length", body.len().to_string())
+                    .ok();
+                response.insert_header("Connection", "close").ok();
+                response.insert_header("Server", SERVER_NAME).ok();
+                response.insert_header("X-Reason", reason).ok();
+                let _ = session.write_response_header(Box::new(response), false).await;
+                let _ = session.write_response_body(Some(body.into()), true).await;
+                false
+            }
+        }
+    }
+
+    /// `ngx_http_upstream_init_request` + `ngx_http_upstream_next`.
+    ///
+    /// A request is attempted on one backend and retried on the next (`proxy_next_upstream`,
+    /// `proxy_next_upstream_tries`, `proxy_next_upstream_timeout`) exactly as Nginx does:
+    /// the failure class must be enabled, a non-idempotent request only retries when
+    /// `non_idempotent` is listed, and tries/timeout bound the loop.
+    async fn proxy_pass(&self, session: &mut Session, ctx: &mut RequestContext) -> anyhow::Result<bool> {
+        let current = self.engine.load();
+        let engine = &*current;
+        let selected = ctx
+            .proxying
+            .ok_or_else(|| anyhow::anyhow!("no proxy location"))?;
+        let compiled = engine
+            .location(selected)
+            .ok_or_else(|| anyhow::anyhow!("location disappeared"))?;
+        let conf = compiled
+            .conf
+            .get::<ProxyConf>()
+            .ok_or_else(|| anyhow::anyhow!("no proxy configuration"))?;
+        let pass = conf
+            .pass
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no proxy_pass"))?;
+        let upstream = engine
+            .upstream_for(compiled)
+            .ok_or_else(|| anyhow::anyhow!("unknown upstream"))?;
+        let key = ctx.client.addr.map(|ip| ip.to_string()).unwrap_or_default();
+
+        // `ngx_http_proxy_create_request` is built once: a retry reuses the same request.
+        let method = match &conf.method {
+            Some(template) => {
+                let value = template.eval(&view_as_state(&self.view(ctx), engine.providers));
+                http::Method::from_bytes(value.as_bytes())?
+            }
+            None => session.req_header().method.clone(),
+        };
+        let mut request = RequestHeader::build(method.clone(), b"/", None)?;
+        if conf.pass_request_headers {
+            for (name, value) in session.req_header().headers.iter() {
+                request.insert_header(name.clone(), value.clone())?;
+            }
+        }
+        let path = proxy::proxy_uri(pass, compiled.matcher.matched_prefix(), session.req_header().uri.path());
+        let target = match session.req_header().uri.query() {
+            Some(query) if !query.is_empty() => format!("{path}?{query}"),
+            _ => path,
+        };
+        request.set_uri(target.parse::<Uri>()?);
+        request.set_version(if conf.http_version == 11 {
+            http::Version::HTTP_11
+        } else {
+            http::Version::HTTP_10
+        });
+        request.insert_header("Host", pass.host_header.clone())?;
+        request.insert_header("X-Real-IP", self.real_addr(ctx))?;
+        let view = self.view(ctx);
+        proxy::apply_upstream_headers(conf, &view_as_state(&view, engine.providers), &mut request)?;
+
+        // `proxy_request_buffering`: read the body before connecting. Only requests that
+        // frame a body are read, otherwise `read_request_body` waits for a body that never
+        // arrives. `proxy_pass_request_body off` drops it, `proxy_set_body` replaces it.
+        let mut body = Vec::new();
+        let has_body = conf.pass_request_body
+            && (session
+                .req_header()
+                .headers
+                .contains_key(http::header::CONTENT_LENGTH)
+                || session
+                    .req_header()
+                    .headers
+                    .contains_key("transfer-encoding"));
+        if has_body {
+            while let Some(chunk) = session.read_request_body().await? {
+                body.extend_from_slice(&chunk);
+            }
+        } else {
+            session.drain_request_body().await.ok();
+        }
+        if let Some(template) = &conf.set_body {
+            body = template
+                .eval(&view_as_state(&self.view(ctx), engine.providers))
+                .into_bytes();
+        }
+        if !conf.pass_request_body {
+            body.clear();
+            request.remove_header("content-length");
+            request.remove_header("transfer-encoding");
+        }
+        if !body.is_empty() {
+            request.insert_header("Content-Length", body.len().to_string())?;
+        }
+
+        // `ngx_http_upstream_init_request`: one attempt per peer, bounded by the directive.
+        let mut tries = upstream.peer_count_hint().max(1);
+        if let Some(limit) = conf.next_upstream_tries
+            && limit > 0
+        {
+            tries = tries.min(limit);
+        }
+        let started = std::time::Instant::now();
+        let mut tried: Vec<String> = Vec::new();
+        // Shared with the attempt so a status-based failure only retries when a
+        // further attempt is actually possible (`ngx_http_upstream_next`).
+        let retry = RetryBudget {
+            remaining: tries,
+            mask: conf.next_upstream,
+            timeout: conf.next_upstream_timeout,
+            started,
+            non_idempotent: !matches!(
+                method,
+                http::Method::GET | http::Method::HEAD | http::Method::OPTIONS | http::Method::TRACE
+            ),
+        };
+
+
+        loop {
+            let backend = upstream
+                .select_avoiding(key.as_bytes(), &tried)
+                .ok_or_else(|| anyhow::anyhow!("no live upstreams"))?;
+            let backend_address = backend.address().to_string();
+            tried.push(backend_address.clone());
+            ctx.backend = Some(backend);
+
+            let sni = parse_sni(&pass.host_header);
+            let mut options = PeerOptions::new();
+            options.connection_timeout = conf.connect_timeout;
+            options.total_connection_timeout = conf.connect_timeout;
+            options.read_timeout = conf.read_timeout;
+            options.write_timeout = conf.send_timeout;
+            let mut peer = HttpPeer::new(backend_address, pass.tls, sni);
+            peer.options = options;
+
+            match self
+                .proxy_attempt(session, ctx, conf, pass, &peer, request.clone(), &body, retry)
+                .await
+            {
+                Ok(()) => return Ok(true),
+                Err(proxy::UpstreamError { failure, source }) => {
+                    tries = tries.saturating_sub(1);
+                    log::warn!(
+                        "upstream failure ({failure:#x}) on {}: {source}",
+                        peer.sni
+                    );
+                    // `ngx_http_upstream_next`: the class must be enabled, and a request that
+                    // was already sent is non-idempotent unless listed.
+                    let mut class = failure;
+                    if !matches!(
+                        method,
+                        http::Method::GET | http::Method::HEAD | http::Method::OPTIONS | http::Method::TRACE
+                    ) {
+                        class |= proxy::UpstreamFailures::NON_IDEMPOTENT;
+                    }
+                    let retryable = tries > 0
+                        && conf.next_upstream.contains(class)
+                        && !conf.next_upstream.contains(proxy::UpstreamFailures::OFF)
+                        && conf
+                            .next_upstream_timeout
+                            .map(|limit| started.elapsed() < limit)
+                            .unwrap_or(true);
+                    if !retryable {
+                        return Err(anyhow::anyhow!(
+                            "no live upstreams after {failure:#x} ({source})"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// One upstream attempt (`ngx_http_upstream_connect` 闂?`ngx_http_upstream_process_body`).
+    #[allow(clippy::too_many_arguments)]
+    async fn proxy_attempt(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        conf: &ProxyConf,
+        pass: &proxy::ProxyPass,
+        peer: &HttpPeer,
+        request: RequestHeader,
+        body: &[u8],
+        retry: RetryBudget,
+    ) -> std::result::Result<(), proxy::UpstreamError> {
+        use proxy::UpstreamFailures as F;
+
+        // `ngx_http_upstream_cache`: a fresh entry is served without contacting the peer.
+        // The key and bypass predicates are script-evaluated, so the request variables are
+        // snapshotted once here (`ngx_http_script_run`).
+        if ctx.cache_state_source.is_none() && conf.cache.enabled() {
+            let view = self.view(ctx);
+            let providers = self.engine.load().providers;
+            ctx.cache_state_source = Some(view_as_state(&view, providers));
+        }
+        let cache_request = cache_request_state(conf, session, ctx);
+        if let Some(cache) = &cache_request {
+            if let Some(entry) = cache_lookup(cache) {
+                record_cache_state(ctx, cache, crate::modules::proxy_cache::CacheStatus::Hit);
+                serve_cached(session, &entry).await?;
+                return Ok(());
+            }
+            record_cache_state(ctx, cache, crate::modules::proxy_cache::CacheStatus::Miss);
+        }
+
+        let connector = TransportConnector::new(None);
+        let stream = connector
+            .new_stream(peer)
+            .await
+            .map_err(|error| proxy::UpstreamError::new(F::ERROR, error))?;
+        let mut upstream_session = if peer.is_tls() {
+            let tls = crate::modules::proxy_tls::client(peer, conf)
+                .map_err(|error| proxy::UpstreamError::new(F::ERROR, error))?;
+            let stream = crate::modules::proxy_tls::connect(&tls, stream, peer)
+                .await
+                .map_err(|error| proxy::UpstreamError::new(F::ERROR, error))?;
+            pingora_core::protocols::http::v1::client::HttpSession::new(Box::new(stream))
+        } else {
+            pingora_core::protocols::http::v1::client::HttpSession::new(stream)
+        };
+
+        upstream_session
+            .write_request_header(Box::new(request))
+            .await
+            .map_err(|error| proxy::UpstreamError::new(F::ERROR, error))?;
+        if body.is_empty() {
+            upstream_session
+                .finish_body()
+                .await
+                .map_err(|error| proxy::UpstreamError::new(F::ERROR, error))?;
+        } else {
+            upstream_session
+                .write_body(body)
+                .await
+                .map_err(|error| proxy::UpstreamError::new(F::ERROR, error))?;
+            upstream_session
+                .finish_body()
+                .await
+                .map_err(|error| proxy::UpstreamError::new(F::ERROR, error))?;
+        }
+
+        // `ngx_http_upstream_process_header`.
+        upstream_session.read_response().await.map_err(|error| {
+            let failure = if error.etype() == &ErrorType::ReadTimedout {
+                F::TIMEOUT
+            } else {
+                F::INVALID_HEADER
+            };
+            proxy::UpstreamError::new(failure, error)
+        })?;
+        let mut response = upstream_session
+            .resp_header()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("upstream sent no valid HTTP/1.0 header")
+            })?;
+
+        // `ngx_http_upstream_process_header`: a status listed in `proxy_next_upstream`
+        // releases the peer so the next attempt can run. When no further attempt is
+        // possible, the upstream response itself is delivered (`ngx_http_upstream_next`
+        // keeps `u->state->status` and the client sees that status).
+        if let Some(failure) = proxy::status_failure(response.status.as_u16())
+            && conf.next_upstream.contains(failure)
+            && !conf.next_upstream.contains(proxy::UpstreamFailures::OFF)
+        {
+            if !retry.allows(failure) {
+                ctx.upstream_status = Some(response.status);
+            } else {
+                upstream_session.shutdown().await;
+                return Err(proxy::UpstreamError::new(
+                    failure,
+                    anyhow::anyhow!("upstream status {}", response.status.as_u16()),
+                ));
+            }
+        }
+
+        let view = self.view(ctx);
+        let current = self.engine.load();
+        let state = view_as_state(&view, current.providers);
+        // `ngx_http_upstream_process_header`: the upstream `Server` is hidden by default,
+        // so this server name replaces it unless `proxy_pass_header Server` kept it.
+        if !proxy::passes_through(conf, "server") {
+            response.insert_header("Server", SERVER_NAME)?;
+        }
+        proxy::apply_response_headers(conf, &mut response);
+        proxy::rewrite_response_headers(conf, pass, &state, &mut response)?;
+        if let Some(selected) = ctx.proxying
+            && let Some(location) = current.location(selected)
+            && let Some(headers) = location.conf.get::<HeadersConf>()
+        {
+            headers.apply(&mut response, &view)?;
+        }
+        let is_head = session.req_header().method == http::Method::HEAD;
+        let mut ended = is_head || response.status == StatusCode::NO_CONTENT;
+        // `ngx_http_upstream_cacheable`: the entry needs the full body and headers.
+        let cacheable = cache_request
+            .as_ref()
+            .is_some_and(|request| !request.key.is_empty());
+        let cached_headers: Vec<(String, String)> = if cacheable {
+            response
+                .headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let cached_status = response.status.as_u16();
+        let mut collecting: Option<Vec<u8>> = cacheable.then(Vec::new);
+
+        // `ngx_http_upstream_send_response`: with `proxy_buffering on` the body is collected
+        // through the event pipe (memory, then `proxy_temp_path`), otherwise every chunk is
+        // forwarded as it arrives (`ngx_http_upstream_process_non_buffered_upstream`).
+        let mut buffer = crate::modules::proxy_buffer::ResponseBuffer::new(
+            conf.buffering,
+            conf.buffers,
+            conf.busy_buffers_size,
+            conf.max_temp_file_size,
+            conf.temp_path.clone(),
+            conf.limit_rate,
+        );
+        // `proxy_intercept_errors`: a response with status >= 300 is not sent to the
+        // client; the body is read first so `error_page` can take over
+        // (`ngx_http_upstream_intercept_errors`).
+        if conf.intercept_errors && response.status.as_u16() >= 300 {
+            let mut body = Vec::new();
+            while let Ok(Some(chunk)) = upstream_session.read_body_bytes().await {
+                body.extend_from_slice(&chunk);
+                if upstream_session.is_body_done() {
+                    break;
+                }
+            }
+            upstream_session.shutdown().await;
+            ctx.intercepted = Some((
+                response.status.as_u16(),
+                body,
+                response
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            value.to_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect(),
+            ));
+            return Ok(());
+        }
+
+        session
+            .write_response_header(Box::new(response), ended)
+            .await?;
+        while !ended {
+            match upstream_session.read_body_bytes().await {
+                Ok(Some(chunk)) => {
+                    let done = upstream_session.is_body_done();
+                    if let Some(collected) = collecting.as_mut() {
+                        collected.extend_from_slice(&chunk);
+                    }
+                    match buffer.push(chunk.len()) {
+                        crate::modules::proxy_buffer::Push::Buffered => {}
+                        crate::modules::proxy_buffer::Push::Spooled => {
+                            // `ngx_event_pipe_write_chain_to_temp_file`: the response is
+                            // spooled to `proxy_temp_path`, so a large upstream body does not
+                            // grow the process memory.
+                            spool(&mut buffer, &chunk);
+                        }
+                    }
+                    // `proxy_limit_rate` bounds the client side transfer.
+                    if let Some(delay) = buffer.rate_delay(chunk.len()) {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let length = chunk.len();
+                    session.write_response_body(Some(chunk), done).await?;
+                    buffer.flush(length);
+                    ended = done;
+                }
+                Ok(None) => {
+                    session.write_response_body(None, true).await?;
+                    ended = true;
+                }
+                Err(error) => {
+                    // The response header is already sent, so the client sees a truncated
+                    // body; `ngx_http_upstream_next` cannot retry at this point.
+                    session.write_response_body(None, true).await.ok();
+                    return Err(proxy::UpstreamError::new(F::ERROR, error));
+                }
+            }
+        }
+        upstream_session.shutdown().await;
+        if let Some(path) = buffer.temp_file() {
+            // `ngx_temp_file_delete`-like cleanup once the response has been relayed.
+            let _ = std::fs::remove_file(path);
+        }
+        // `ngx_http_upstream_send_response` tail: store the entry when cacheable.
+        if let (Some(request), Some(body)) = (&cache_request, collecting)
+            && !request.key.is_empty()
+            && !ctx.cache_bypassed.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            cache_store(request, cached_status, &cached_headers, &body);
+        }
+        Ok(())
+    }
+}
+
+/// Per-request cache decision (`ngx_http_upstream_cache`).
+struct CacheRequest {
+    zone: crate::modules::proxy_cache::CacheZone,
+    conf: crate::modules::proxy_cache::CacheConf,
+    key: String,
+    file: std::path::PathBuf,
+}
+
+/// Build the cache lookup for this request, honouring `proxy_cache_methods` and
+/// `proxy_cache_bypass`.
+fn cache_request_state(
+    conf: &ProxyConf,
+    session: &Session,
+    ctx: &RequestContext,
+) -> Option<CacheRequest> {
+    let cache = &conf.cache;
+    let zone_name = cache.zone.as_ref()?;
+    if !cache.caches_method(session.req_header().method.as_str()) {
+        return None;
+    }
+    let zone = match crate::modules::proxy_cache::zone(zone_name) {
+        Some(zone) => zone,
+        None => {
+            log::debug!("proxy_cache: zone {zone_name} is not registered");
+            return None;
+        }
+    };
+    let Some(state) = ctx.cache_state_source.as_ref() else {
+        log::debug!("proxy_cache: no request snapshot for the cache decision");
+        return None;
+    };
+    // `proxy_cache_bypass`: any non-empty evaluation bypasses the cache (`ngx_http_test_predicates`).
+    if cache
+        .bypass
+        .iter()
+        .any(|template| !template.eval(state).is_empty())
+    {
+        ctx.cache_bypassed.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Some(CacheRequest {
+            file: zone.file_path(""),
+            zone,
+            conf: cache.clone(),
+            key: String::new(),
+        });
+    }
+    let key = cache.key_template().ok()?.eval(state);
+    let file = zone.file_path(&key);
+    Some(CacheRequest {
+        zone,
+        conf: cache.clone(),
+        key,
+        file,
+    })
+}
+
+/// `ngx_http_file_cache_open`: read a fresh entry for this request.
+fn cache_lookup(request: &CacheRequest) -> Option<crate::modules::proxy_cache::CacheEntry> {
+    if request.key.is_empty() {
+        return None;
+    }
+    let bytes = std::fs::read(&request.file).ok()?;
+    let entry = crate::modules::proxy_cache::CacheEntry::decode(&bytes)?;
+    let now = crate::modules::proxy_cache::now_seconds();
+    entry.is_fresh(now).then_some(entry)
+}
+
+fn record_cache_state(
+    ctx: &RequestContext,
+    request: &CacheRequest,
+    status: crate::modules::proxy_cache::CacheStatus,
+) {
+    let mut state = crate::modules::proxy_cache::CacheState {
+        status: Some(status),
+        key: Some(request.key.clone()),
+        file: Some(request.file.clone()),
+    };
+    if request.key.is_empty() {
+        state.status = Some(crate::modules::proxy_cache::CacheStatus::Bypass);
+    }
+    ctx.cache_status.set(state);
+}
+
+/// Serve a stored entry (`ngx_http_file_cache_read` + the normal body pipeline).
+async fn serve_cached(
+    session: &mut Session,
+    entry: &crate::modules::proxy_cache::CacheEntry,
+) -> anyhow::Result<()> {
+    let mut response = ResponseHeader::build(
+        StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK),
+        None,
+    )?;
+    for (name, value) in &entry.headers {
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            http::header::HeaderValue::from_str(value),
+        ) {
+            let _ = response.append_header(name, value);
+        }
+    }
+    response.insert_header("Server", SERVER_NAME)?;
+    response.insert_header("Content-Length", entry.body.len().to_string())?;
+    let is_head = session.req_header().method == http::Method::HEAD;
+    session
+        .write_response_header(Box::new(response), is_head)
+        .await?;
+    if !is_head {
+        session
+            .write_response_body(Some(entry.body.clone().into()), true)
+            .await?;
+    }
+    Ok(())
+}
+
+/// `ngx_http_file_cache_set_header` + the body: store a response for later hits.
+fn cache_store(
+    request: &CacheRequest,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+) {
+    use crate::modules::proxy_cache::CacheEntry;
+
+    // `proxy_no_cache`: a non-empty value keeps the response out of the cache.
+    let now = crate::modules::proxy_cache::now_seconds();
+    let fresh = crate::modules::proxy_cache::freshness(headers, status, &request.conf, now);
+    let Some(valid_until) = fresh else {
+        return;
+    };
+    let etag = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+        .map(|(_, value)| value.clone());
+    let last_modified = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("last-modified"))
+        .map(|(_, value)| value.clone());
+    let entry = CacheEntry {
+        status,
+        headers: headers.to_vec(),
+        body: body.to_vec(),
+        valid_until,
+        stored_at: now,
+        etag,
+        last_modified,
+    };
+    if let Some(parent) = request.file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = request.zone;
+    let mut temporary = request.file.clone();
+    temporary.set_extension("tmp");
+    if std::fs::write(&temporary, entry.encode()).is_ok() {
+        // `ngx_http_file_cache_set_header`: the entry becomes visible atomically.
+        let _ = std::fs::rename(&temporary, &request.file);
+    }
+}
+
+/// Append `chunk` to the buffering temp file, mirroring
+/// `ngx_event_pipe_write_chain_to_temp_file`.
+fn spool(buffer: &mut crate::modules::proxy_buffer::ResponseBuffer, chunk: &[u8]) {
+    let path = match buffer.temp_file().map(std::path::Path::to_path_buf) {
+        Some(path) => path,
+        None => {
+            let Some(template) = buffer.temp_file_path() else {
+                return;
+            };
+            if let Some(parent) = template.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            buffer.set_temp_file(template.clone());
+            template
+        }
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = file.write_all(chunk);
+    }
+}
+
+/// One listener's downstream service: TLS termination followed by the HTTP session loop.
+///
+/// Pingora's `HttpProxy` is itself the `ServerApp`, so it starts parsing HTTP as soon as a
+/// connection is accepted. A `listen ... ssl` listener must complete the TLS handshake first
+/// (SNI selects the `server {}` and produces the `$ssl_*` facts), so `Bridge` terminates the
+/// connection and then runs the same session loop, exactly where Nginx runs `c->ssl->handler`
+/// before `ngx_http_wait_request_handler`.
+#[derive(Clone)]
+pub struct Bridge {
+    app: Arc<HttpCoreApp>,
+}
+
+impl Bridge {
+    pub fn new(app: Arc<HttpCoreApp>) -> Self {
+        Self { app }
+    }
+}
+
+#[async_trait]
+impl pingora_core::apps::ServerApp for Bridge {
+    async fn process_new(
+        self: &Arc<Self>,
+        stream: pingora_core::protocols::Stream,
+        shutdown: &ShutdownWatch,
+    ) -> Option<pingora_core::protocols::Stream> {
+        // `c->ssl->handler`: terminate TLS before any HTTP byte is parsed.
+        let stream: pingora_core::protocols::Stream = match self.app.tls() {
+            None => stream,
+            Some(listener_tls) => {
+                match crate::core::tls::accept(stream, listener_tls, TLS_HANDSHAKE_TIMEOUT).await {
+                    Ok(tls_stream) => Box::new(tls_stream),
+                    Err(error) => {
+                        log::info!("TLS handshake with {} failed: {error:#}", self.app.listen());
+                        return None;
+                    }
+                }
+            }
+        };
+        if stream.selected_alpn_proto() == Some(pingora_core::protocols::ALPN::H2) {
+            return self.serve_h2(stream, shutdown).await;
+        }
+        self.serve_h1(stream, shutdown).await
+    }
+}
+
+impl Bridge {
+    /// `ngx_http_wait_request_handler` + `ngx_http_keepalive_handler` for HTTP/1.x.
+    async fn serve_h1(
+        self: &Arc<Self>,
+        stream: pingora_core::protocols::Stream,
+        shutdown: &ShutdownWatch,
+    ) -> Option<pingora_core::protocols::Stream> {
+        let mut session = pingora_proxy::Session::new_h1(stream);
+        session.set_keepalive(Some(60));
+        loop {
+            let request = tokio::select! {
+                biased;
+                request = session.read_request() => request,
+                _ = shutdown_signal(shutdown) => return None,
+            };
+            match request {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(error) => {
+                    log::debug!("HTTP server fails to read from downstream: {error}");
+                    return None;
+                }
+            }
+            session = match Box::pin(self.serve_request(session)).await {
+                Some(session) => session,
+                None => return None,
+            };
+        }
+    }
+
+    /// Route one parsed request (`Self::process_request`) to a response.
+    async fn serve_request(
+        self: &Arc<Self>,
+        mut session: pingora_proxy::Session,
+    ) -> Option<pingora_proxy::Session> {
+        let mut ctx = self.app.new_request_context();
+        let keep = match self.app.route_request(&mut session, &mut ctx).await {
+            Ok(PhaseOutcome::Answered) => true,
+            Ok(PhaseOutcome::Proxy) => self.app.proxy_request(&mut session, &mut ctx).await,
+            Err(error) => {
+                log::error!("request failed: {error}");
+                false
+            }
+        };
+        self.app.log_request(&mut session, &ctx, None).await;
+        if !keep {
+            return None;
+        }
+        // `HttpProxy::finish`: keep the connection for the next keepalive request.
+        let downstream = session.downstream_session;
+        let (stream, pipelined) = match downstream.finish().await {
+            Ok(Some(reusable)) => reusable.into_parts(),
+            _ => return None,
+        };
+        if pipelined.is_some_and(|prefix| !prefix.is_empty()) {
+            return None;
+        }
+        Some(pingora_proxy::Session::new_h1(stream))
+    }
+
+    /// HTTP/2 (`ngx_http_v2_init`): one session per stream on a shared connection.
+    ///
+    /// `listen ... http2` advertises `h2` through ALPN; a client which selects it must be
+    /// served or the connection would be closed without a response. Streams are accepted in
+    /// a loop until the client closes the connection (`ngx_http_v2_read_handler`).
+    async fn serve_h2(
+        self: &Arc<Self>,
+        stream: pingora_core::protocols::Stream,
+        shutdown: &ShutdownWatch,
+    ) -> Option<pingora_core::protocols::Stream> {
+        use pingora_core::protocols::http::v2::server;
+
+        let digest = std::sync::Arc::new(pingora_core::protocols::Digest::default());
+        let mut conn = match server::handshake(stream, Some(server::default_h2_options())).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                log::debug!("HTTP/2 handshake failed: {error}");
+                return None;
+            }
+        };
+        let mut malformed = 0usize;
+        loop {
+            let accepted = tokio::select! {
+                biased;
+                accepted = server::HttpSession::from_h2_conn(&mut conn, digest.clone()) => accepted,
+                _ = shutdown_signal(shutdown) => return None,
+            };
+            match accepted {
+                Ok(Some(server::H2Accept::Session(h2))) => {
+                    self.serve_h2_stream(h2).await;
+                }
+                Ok(Some(server::H2Accept::Rejected)) => {
+                    // The stream was answered or reset during acceptance; siblings continue.
+                    malformed += 1;
+                    if malformed >= 100 {
+                        log::debug!("tearing down downstream h2 connection after {malformed} rejected streams");
+                        return None;
+                    }
+                }
+                Ok(None) => return None,
+                Err(error) => {
+                    log::debug!("HTTP/2 connection ended: {error}");
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Serve one HTTP/2 stream. Every stream is independent, so a failure only ends that
+    /// stream (`ngx_http_v2_state_headers` → finalize request).
+    ///
+    /// `pingora_proxy::Session` has no public constructor taking an HTTP/2 stream, but its
+    /// `downstream_session` field is public: a throwaway session is built from an empty
+    /// stream and the real HTTP/2 flow replaces it. The placeholder is never read.
+    async fn serve_h2_stream(
+        self: &Arc<Self>,
+        h2: pingora_core::protocols::http::v2::server::HttpSession,
+    ) {
+        // A real loopback socket is used as the throwaway placeholder: pingora's `IO` has no
+        // in-memory implementation and the stream is never read after the swap.
+        let placeholder: pingora_core::protocols::Stream = placeholder_stream()
+            .await
+            .expect("loopback placeholder stream");
+        let mut session = pingora_proxy::Session::new_h1(placeholder);
+        // The field is already a `Box<HttpSession>`; `into()` avoids a redundant allocation.
+        session.downstream_session =
+            pingora_core::protocols::http::ServerSession::new_http2(h2).into();
+        let mut ctx = self.app.new_request_context();
+        let keep = match self.app.route_request(&mut session, &mut ctx).await {
+            Ok(PhaseOutcome::Answered) => true,
+            Ok(PhaseOutcome::Proxy) => self.app.proxy_request(&mut session, &mut ctx).await,
+            Err(error) => {
+                log::error!("request failed: {error}");
+                false
+            }
+        };
+        self.app.log_request(&mut session, &ctx, None).await;
+        let _ = keep;
+    }
+}
+
+/// A throwaway connected loopback socket, used only as the placeholder downstream stream
+/// of a `pingora_proxy::Session` whose real flow is swapped in afterwards.
+async fn placeholder_stream() -> Option<pingora_core::protocols::Stream> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    let address = listener.local_addr().ok()?;
+    let (client, _accepted) = tokio::join!(
+        tokio::net::TcpStream::connect(address),
+        listener.accept()
+    );
+    let client: tokio::net::TcpStream = client.ok()?;
+    let stream: pingora_core::protocols::Stream =
+        Box::new(pingora_core::protocols::l4::stream::Stream::from(client));
+    Some(stream)
+}
+
+/// Resolve when the service starts shutting down.
+async fn shutdown_signal(shutdown: &ShutdownWatch) -> bool {
+    loop {
+        if *shutdown.borrow() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 #[async_trait]
@@ -698,6 +1712,13 @@ impl ProxyHttp for HttpCoreApp {
             started: std::time::Instant::now(),
             ssl: None,
             ssl_server: None,
+            upstream_status: None,
+            cache_status: CacheStatusCell::default(),
+            cache_bypassed: std::sync::atomic::AtomicBool::new(false),
+            cache_state_source: None,
+            error_page_served: false,
+            error_page_status: None,
+            intercepted: None,
         }
     }
 
@@ -883,6 +1904,7 @@ impl HttpCoreApp {
                 .unwrap_or_default(),
             body_bytes_sent: 0,
             limit_req_status: None,
+            cache_status: ctx.cache_status.name(),
         }
     }
 
@@ -1107,6 +2129,3 @@ fn parse_sni(host_header: &str) -> String {
 fn engine_error(error: impl std::fmt::Display) -> Box<Error> {
     Error::explain(ErrorType::InternalError, error.to_string())
 }
-
-#[allow(dead_code)]
-fn _unused(_: IpAddr) {}

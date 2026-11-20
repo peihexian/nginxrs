@@ -1,4 +1,4 @@
-﻿use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nginxrs::config::Config;
 use nginxrs::core::http_core::Engine;
@@ -117,6 +117,7 @@ fn main() -> Result<()> {
     let reload_target = engine.clone();
     let reload_config = config_path.clone();
     let reload_stats = stats.clone();
+    let stop_pid_file = pid_file.clone();
     let reloader = Arc::new(Reloader {
         config_path: config_path.clone(),
         swap: Arc::new(move || {
@@ -129,6 +130,12 @@ fn main() -> Result<()> {
             log::info!("configuration reloaded from {}", reload_config.display());
             let _ = servers;
             Ok(())
+        }),
+        // `nginx -s stop`: terminate the process and release the pid/control descriptors.
+        stop: Arc::new(move || {
+            log::info!("stop requested; shutting down");
+            reload::remove_descriptors(&stop_pid_file);
+            std::process::exit(0);
         }),
     });
 
@@ -174,23 +181,29 @@ fn main() -> Result<()> {
         None => None,
     };
     let stats = Arc::new(nginxrs::core::http_core::TlsStats::default());
+    // One process-wide session cache set: `ssl_session_cache shared:NAME` zones are shared
+    // by every listener, as they are by every worker in Nginx.
+    let sessions = Arc::new(nginxrs::modules::ssl::sessions::SharedCaches::default());
     for listen in listeners {
         let mut app = nginxrs::core::http_core::HttpCoreApp::new(Arc::clone(&engine), listen.clone());
         let hosts = runtime.as_ref().and_then(|runtime| {
             ssl::virtual_hosts(&config, runtime, &listen).map(|(hosts, buffer)| {
                 nginxrs::core::http_core::ListenerTls {
                     hosts,
-                    sessions: Arc::new(nginxrs::modules::ssl::sessions::SharedCaches::default()),
+                    sessions: sessions.clone(),
                     buffer_size: buffer,
                     stats: stats.clone(),
                 }
             })
         });
+        let secure = hosts.is_some();
         app.apply_tls(hosts);
-        let mut service =
-            pingora_proxy::http_proxy_service(&server.configuration, app);
+        let mut service = pingora_core::services::listening::Service::new(
+            format!("nginxrs listener {listen}"),
+            nginxrs::core::http_core::Bridge::new(Arc::new(app)),
+        );
         service.add_tcp(&listen);
-        if runtime.is_some() && ssl::virtual_hosts(&config, runtime.as_ref().unwrap(), &listen).is_some() {
+        if secure {
             log::info!("nginxrs listening on https://{listen}");
         } else {
             log::info!("nginxrs listening on http://{listen}");

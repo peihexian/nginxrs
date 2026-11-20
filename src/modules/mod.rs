@@ -22,6 +22,7 @@ pub mod access;
 pub mod balancer;
 pub mod body;
 pub mod ctx;
+pub mod error_page;
 pub mod headers;
 pub mod http_core;
 pub mod limit_conn;
@@ -30,6 +31,10 @@ pub mod location;
 pub mod log;
 pub mod lua;
 pub mod proxy;
+pub mod proxy_buffer;
+pub mod proxy_cache;
+pub mod proxy_rewrite;
+pub mod proxy_tls;
 pub mod realip;
 pub mod registry;
 pub mod respond;
@@ -51,4 +56,5 @@ pub use registry::{DirectiveView, Registry};
 pub const PROVIDERS: &[(&str, &dyn crate::core::variables::VariableProvider)] = &[
     ("realip_remote_addr", &realip::REALIP_REMOTE_ADDR),
     ("realip_remote_port", &realip::REALIP_REMOTE_PORT),
+    ("upstream_cache_status", &proxy::CACHE_STATUS),
 ];

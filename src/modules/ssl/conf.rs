@@ -125,7 +125,7 @@ pub struct OcspConf {
 /// The pre-merge value keeps `Option`s so the merge can tell "not set here" from an
 /// explicit value; [`TlsServerConf::merge`] produces the fully resolved configuration the
 /// runtime uses.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TlsServerConf {
     /// `ssl` in effect for any `listen` of this server (set by the listener, not a
     /// directive).
@@ -151,35 +151,6 @@ pub struct TlsServerConf {
     pub early_data: Option<bool>,
     pub reject_handshake: Option<bool>,
     pub ocsp: OcspConf,
-}
-
-impl Default for TlsServerConf {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            certificates: Vec::new(),
-            certificate_keys: Vec::new(),
-            passwords: Vec::new(),
-            dhparam: None,
-            protocols: None,
-            ciphers: None,
-            buffer_size: None,
-            verify_client: None,
-            verify_depth: None,
-            client_certificate: None,
-            trusted_certificate: None,
-            crl: None,
-            prefer_server_ciphers: None,
-            session_cache: None,
-            session_tickets: None,
-            session_ticket_keys: Vec::new(),
-            session_timeout: None,
-            ecdh_curve: None,
-            early_data: None,
-            reject_handshake: None,
-            ocsp: OcspConf::default(),
-        }
-    }
 }
 
 /// Effective TLS values for one server.
@@ -222,6 +193,11 @@ impl Default for TlsSettings {
 pub const DEFAULT_CIPHERS: &str = "HIGH:!aNULL:!MD5";
 
 impl TlsServerConf {
+    /// `ssl_reject_handshake on` for this server (`handshake_rejected`).
+    pub fn reject_handshake_enabled(&self) -> bool {
+        self.reject_handshake.unwrap_or(false)
+    }
+
     /// `ngx_http_ssl_merge_srv_conf`: apply `http {}`-level defaults and the built-in
     /// defaults.
     pub fn merge(parent: Option<&TlsServerConf>, child: &TlsServerConf) -> Self {
@@ -298,14 +274,17 @@ mod tests {
 
     #[test]
     fn merge_prefers_child_and_falls_back_to_parent() {
-        let mut parent = TlsServerConf::default();
-        parent.protocols = Some(Protocols(Protocols::TLSV1_2 | Protocols::TLSV1_3));
-        parent.verify_client = Some(VerifyClient::Optional);
-        parent.session_tickets = Some(false);
+        let parent = TlsServerConf {
+            protocols: Some(Protocols(Protocols::TLSV1_2 | Protocols::TLSV1_3)),
+            verify_client: Some(VerifyClient::Optional),
+            session_tickets: Some(false),
+            ..Default::default()
+        };
 
-        let mut child = TlsServerConf::default();
-        child.verify_depth = Some(4);
-
+        let child = TlsServerConf {
+            verify_depth: Some(4),
+            ..Default::default()
+        };
         let merged = TlsServerConf::merge(Some(&parent), &child);
         let settings = merged.settings();
         // `ssl_protocols` only exists in the server context; the parent value is inherited.

@@ -29,11 +29,11 @@ pub enum CertSelector {
     Default,
     /// Literal (lowercased) host name.
     Hash(String),
-    /// `*.example.com` — a leading wildcard label.
+    /// `*.example.com` 闁?a leading wildcard label.
     Wildcard(String),
-    /// `.example.com` — matches the domain and every sub-domain.
+    /// `.example.com` 闁?matches the domain and every sub-domain.
     Suffix(String),
-    /// `~^www\d+\.example\.com$` — PCRE selector.
+    /// `~^www\d+\.example\.com$` 闁?PCRE selector.
     Regex(regex::Regex),
 }
 
@@ -424,6 +424,19 @@ pub fn build_client_verifier(
 
 /// Load every `ssl_certificate` pair of one server into a resolver.
 pub fn load_resolver(conf: &TlsServerConf, provider: &Arc<CryptoProvider>) -> Result<CertificateResolver> {
+    // `ssl_stapling_file`: the pre-fetched OCSP response stapled to the leaf certificate
+    // (`ngx_ssl_stapling_file` reads it with `d2i_OCSP_RESPONSE`).
+    // `ssl_stapling on` sources the response from `ssl_stapling_file` when set, otherwise
+    // from `ssl_stapling_responder` (`ngx_ssl_stapling` → `ngx_ssl_stapling_responder`).
+    let stapled = if conf.ocsp.stapling {
+        match (&conf.ocsp.stapling_file, &conf.ocsp.stapling_responder) {
+            (Some(path), _) => Some(load_stapled_response(path)?),
+            (None, Some(responder)) => Some(fetch_stapled_response(conf, responder)?),
+            (None, None) => None,
+        }
+    } else {
+        None
+    };
     let mut named = Vec::new();
     for pair in &conf.certificates {
         let chain = codec::load_certificates(&pair.certificate, "ssl_certificate")?;
@@ -438,7 +451,7 @@ pub fn load_resolver(conf: &TlsServerConf, provider: &Arc<CryptoProvider>) -> Re
                 key_path.display()
             );
         }
-        let certified = rustls::sign::CertifiedKey::from_der(chain.clone(), key, &provider)
+        let mut certified = rustls::sign::CertifiedKey::from_der(chain.clone(), key, provider)
             .map_err(|error| {
                 anyhow::anyhow!(
                     "key values mismatch in {} / {}: {error}",
@@ -446,6 +459,9 @@ pub fn load_resolver(conf: &TlsServerConf, provider: &Arc<CryptoProvider>) -> Re
                     key_path.display()
                 )
             })?;
+        if let Some(staple) = &stapled {
+            certified.ocsp = Some(staple.clone());
+        }
         let mut selectors = Vec::new();
         for name in &pair.selectors {
             selectors.push(CertSelector::parse(name)?);
@@ -459,8 +475,130 @@ pub fn load_resolver(conf: &TlsServerConf, provider: &Arc<CryptoProvider>) -> Re
     Ok(CertificateResolver::new(named))
 }
 
-fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let bundle = codec::parse_pem_file(path, "ssl_certificate_key")?;
+/// `ngx_ssl_stapling_responder`: build the OCSP request and fetch the response.
+fn fetch_stapled_response(conf: &TlsServerConf, responder: &str) -> Result<Vec<u8>> {
+    let pair = conf
+        .certificates
+        .first()
+        .context("ssl_stapling_responder needs an ssl_certificate")?;
+    let chain = codec::load_certificates(&pair.certificate, "ssl_certificate")?;
+    let leaf = chain.first().context("empty ssl_certificate")?.clone();
+    // The chain is leaf-first, so the issuer is the next certificate when present.
+    let issuer = chain.get(1).cloned().unwrap_or(leaf.clone());
+    let request = build_ocsp_request(leaf.as_ref(), issuer.as_ref());
+    let response = super::stapling::fetch(responder, &request)?;
+    // `ssl_stapling_verify on`: `ngx_ssl_stapling_verify` validates the response before
+    // installing it, so a broken or unrelated staple never reaches a handshake.
+    if conf.ocsp.stapling_verify {
+        let verified = super::ocsp_verify::verify(response.as_slice(), leaf.as_ref(), issuer.as_ref())
+            .with_context(|| format!("invalid OCSP response from {responder}"))?;
+        if verified.status == super::ocsp_verify::CertStatus::Revoked {
+            bail!("the certificate is revoked according to {responder}");
+        }
+    }
+    Ok(response)
+}
+
+/// Minimal DER `OCSPRequest` with a single SHA-1 `CertID`, matching what
+/// `ngx_event_openssl_stapling.c` sends (`OCSP_REQUEST` + one `OCSP_CERTID`).
+fn build_ocsp_request(certificate: &[u8], issuer: &[u8]) -> Vec<u8> {
+    let _ = certificate;
+    fn der(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let length = payload.len();
+        if length < 0x80 {
+            out.push(length as u8);
+        } else if length < 0x100 {
+            out.push(0x81);
+            out.push(length as u8);
+        } else {
+            out.push(0x82);
+            out.push((length >> 8) as u8);
+            out.push(length as u8);
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+    fn sequence(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload: Vec<u8> = items.iter().flat_map(|item| item.iter().copied()).collect();
+        der(0x30, &payload)
+    }
+    let sha1_alg = sequence(&[der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a]), der(0x05, &[])]);
+    let digest = |bytes: &[u8]| -> Vec<u8> {
+        use sha1::Digest;
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(bytes);
+        der(0x04, &hasher.finalize())
+    };
+    let name_hash = digest(issuer);
+    let key_hash = digest(&subject_public_key_info(issuer));
+    let cert_id = sequence(&[sha1_alg, name_hash, key_hash, der(0x02, &[0x00])]);
+    let request = sequence(&[cert_id]);
+    sequence(&[request])
+}
+
+/// The DER `SubjectPublicKeyInfo` of a certificate, used as the OCSP `KeyHash` input.
+fn subject_public_key_info(certificate: &[u8]) -> Vec<u8> {
+    // A full X.509 parse is unnecessary for a hash input: take the outermost SEQUENCE that
+    // contains the RSA/EC algorithm identifier followed by a BIT STRING.
+    let mut best = Vec::new();
+    let mut index = 0;
+    while index + 2 < certificate.len() {
+        if certificate[index] == 0x30 {
+            let length_byte = certificate[index + 1];
+            let (header, length) = if length_byte < 0x80 {
+                (2, length_byte as usize)
+            } else {
+                let count = (length_byte & 0x7f) as usize;
+                if count == 0 || count > 2 || index + 2 + count > certificate.len() {
+                    break;
+                }
+                let mut length = 0usize;
+                for offset in 0..count {
+                    length = (length << 8) | certificate[index + 2 + offset] as usize;
+                }
+                (2 + count, length)
+            };
+            if index + header + length <= certificate.len() && length > 40 {
+                let inner = &certificate[index + header..index + header + length];
+                if inner.len() > 8 && inner[0] == 0x30 && inner.contains(&0x03) {
+                    best = certificate[index..index + header + length].to_vec();
+                    break;
+                }
+            }
+        }
+        index += 1;
+    }
+    best
+}
+
+/// `ngx_ssl_stapling_file`: read a DER (or PEM) OCSP response for stapling.
+fn load_stapled_response(path: &Path) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("cannot load {}: {error}", path.display()))?;
+    // A PEM-wrapped response (BEGIN OCSP RESPONSE) is accepted as well.
+    if bytes.starts_with(b"-----BEGIN") {
+        let text = String::from_utf8_lossy(&bytes);
+        // The body starts after the first header line and ends at the END marker.
+        let body_start = text.find("\n").map(|offset| offset + 1).unwrap_or(0);
+        let body_end = text[body_start..]
+            .find("-----END")
+            .map(|offset| body_start + offset)
+            .unwrap_or(text.len());
+        let body: String = text[body_start..body_end]
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        return base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
+            .map_err(|error| anyhow::anyhow!("invalid ssl_stapling_file: {error}"));
+    }
+    if bytes.is_empty() {
+        bail!("the stapling file {} is empty", path.display());
+    }
+    Ok(bytes)
+}
+
+fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {    let bundle = codec::parse_pem_file(path, "ssl_certificate_key")?;
     bundle
         .keys
         .into_iter()
@@ -505,6 +643,29 @@ pub fn sni_matches_any(server_names: &[String], sni: &str) -> bool {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn stapling_file_accepts_der_and_pem() {
+        let dir = std::env::temp_dir().join(format!("nginxrs-ocsp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let der = dir.join("response.der");
+        let payload = b"\x30\x03\x0a\x01\x00";
+        std::fs::write(&der, payload).unwrap();
+        assert_eq!(load_stapled_response(&der).unwrap(), payload);
+
+        let pem = dir.join("response.pem");
+        std::fs::write(
+            &pem,
+            "-----BEGIN OCSP RESPONSE-----\nMAMKAQA=\n-----END OCSP RESPONSE-----\n",
+        )
+        .unwrap();
+        assert_eq!(load_stapled_response(&pem).unwrap(), payload);
+
+        let empty = dir.join("empty.der");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(load_stapled_response(&empty).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn selectors_parse_nginx_forms() {
         assert!(matches!(
@@ -533,7 +694,7 @@ mod tests {
     fn wildcard_covers_one_label_only() {
         let selector = CertSelector::parse("*.example.com").unwrap();
         assert!(selector.matches("www.example.com"));
-        assert!(selector.matches("a.b.example.com") == false);
+        assert!(!selector.matches("a.b.example.com"));
         assert!(!selector.matches("example.com"));
     }
 

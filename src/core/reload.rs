@@ -37,6 +37,8 @@ pub fn control_path(pid_file: &Path) -> PathBuf {
 pub struct Reloader {
     pub config_path: PathBuf,
     pub swap: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    /// Stops the server (`nginx -s stop`); the default exits the process.
+    pub stop: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Reloader {
@@ -80,11 +82,17 @@ fn handle_control(stream: TcpStream, reloader: &Reloader) -> std::io::Result<()>
             Ok(()) => format!("ok {}\n", reloader.config_path.display()),
             Err(error) => format!("error: {error:#}\n"),
         },
-        STOP => "ok stopping\n".to_string(),
+        STOP => String::new(),
         other => format!("error: unknown command \"{other}\"\n"),
     };
     let mut stream = stream;
     stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    if line.trim() == STOP {
+        // `nginx -s stop`: acknowledge first, then terminate. The reply is flushed above so
+        // the client reads it before the process disappears.
+        (reloader.stop)();
+    }
     Ok(())
 }
 
@@ -161,6 +169,7 @@ mod tests {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }),
+            stop: Arc::new(|| {}),
         });
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         serve_control(listener, reloader, shutdown.clone()).unwrap();
@@ -181,6 +190,7 @@ mod tests {
         let reloader = Arc::new(Reloader {
             config_path: PathBuf::from("broken.conf"),
             swap: Arc::new(|| bail!("unknown directive \"broken\"")),
+            stop: Arc::new(|| {}),
         });
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         serve_control(listener, reloader, shutdown.clone()).unwrap();

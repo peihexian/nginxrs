@@ -45,7 +45,11 @@ src/
 ## 已实现
 
 - **静态文件**：`root`、`index`、`try_files`、`autoindex`、`types`/`default_type`、GET/HEAD、ETag、Last-Modified、304、单区间 Range。
-- **反向代理**：HTTP/HTTPS 上游、直连 `proxy_pass http://IP:PORT` 与命名 upstream、请求体与响应体流式转发、超时、请求/响应头修改、连接失败与幂等请求重试。
+- **反向代理**（对齐 `ngx_http_proxy_module`）：HTTP/HTTPS 上游、直连 `proxy_pass http://IP:PORT` 与命名 upstream、
+  请求体与响应体流式转发、超时、连接失败与幂等请求重试；请求构造 `proxy_set_header`/`proxy_method`/`proxy_set_body`/
+  `proxy_pass_request_headers`/`proxy_pass_request_body`/`proxy_http_version`；响应处理 `proxy_hide_header`/`proxy_pass_header`/
+  `proxy_ignore_headers`/`proxy_intercept_errors`；响应改写 `proxy_redirect`（含 `default` 语义）/
+  `proxy_cookie_domain`/`proxy_cookie_path`/`proxy_cookie_flags`；缓冲与临时文件、`proxy_limit_rate`、`proxy_store` 参数；  `proxy_cache` 响应缓存（`proxy_cache_path`/`proxy_cache_valid`/`proxy_cache_key`/`proxy_cache_bypass` 与 `$upstream_cache_status`）。
 - **URL 重写**：正则捕获组、变量、`last`、`break`、`redirect`、`permanent`（保留原始查询串）；`return` 在 content 阶段求值，可读取限流变量。
 - **负载均衡**：加权 RoundRobin（默认）、`random`、`ip_hash`、`least_conn`，支持权重、禁用节点和 TCP 主动健康检查。
 - **realip**（对齐 C 版）：`set_real_ip_from` 支持单 IP、CIDR、主机名（配置期解析）与 `unix:`；`real_ip_header` 支持 `X-Real-IP`、`X-Forwarded-For`、自定义头与 `proxy_protocol`；`real_ip_recursive` 按 `ngx_http_get_forwarded_addr` 逐跳信任链回溯；端口仅在头部显式携带时改写；重复 `real_ip_header` 报错。
@@ -53,9 +57,13 @@ src/
 - **限流**：`limit_req`（泄漏桶、`burst`、`delay`、`nodelay`、`dry_run`、自定义状态码）与 `limit_conn`（并发连接，请求结束才释放）；提供 `$limit_req_status`、`$limit_conn_status`。
 - **可观测性**：`stub_status`（Nginx 原格式）与 `prometheus_metrics`（`nginxrs_*` 指标）。
 - **配置重载**：`nginxrs -s reload` 原子替换路由表，校验失败则保留旧配置；Unix 支持 `SIGHUP`。
-- **下游 TLS**：`listen ... ssl` + `ssl_certificate`/`ssl_certificate_key`/`ssl_protocols`，基于 Pingora 的 rustls 监听，自动启用 HTTP/2 ALPN。
+- **下游 TLS**：`listen ... ssl` + 完整 `ngx_http_ssl_module`（多证书 SNI、client 证书验证、
+  会话缓存/票据、密码套件、`$ssl_*` 变量）；TLS 在 HTTP 解析前完成，与 Nginx 的握手回调一致。
+- **反向代理 TLS**：`proxy_pass https://` 支持 `proxy_ssl_verify`、`proxy_ssl_trusted_certificate`、
+  `proxy_ssl_name`/`proxy_ssl_server_name`、`proxy_ssl_protocols`/`proxy_ssl_ciphers`。
 - **Lua**：`access_by_lua_*`、`rewrite_by_lua_*`、`content_by_lua_*`、`header_filter_by_lua_*`，见下文 API。
-- **流媒体分发**：HLS (`.m3u8/.ts`)、DASH (`.mpd/.m4s`)、MP4 等文件的 MIME、流式分块与 Range；反代路径不缓冲整个上游响应。
+- **流媒体分发**：HLS (`.m3u8/.ts`)、DASH (`.mpd/.m4s`)、MP4 等文件的 MIME、流式分块与 Range；反代路径默认按
+  `proxy_buffering` 走事件管道缓冲（内存 + `proxy_temp_path` 临时文件），可用 `proxy_buffering off` 改成逐块转发。
 - **运维**：`-t` 配置检查、Nginx combined 风格访问日志、Rust/env_logger 运行日志。
 
 ## 构建与运行
@@ -149,7 +157,31 @@ http {
 }
 ```
 
-`proxy_pass http://backend/base/` 会将匹配到的 location 前缀替换为 `/base/`；不带 URI 的 `proxy_pass http://backend` 保留重写后的路径。上游使用 HTTPS 时写 `proxy_pass https://backend`，默认校验证书和主机名。
+`proxy_pass http://backend/base/` 会将匹配到的 location 前缀替换为 `/base/`；不带 URI 的 `proxy_pass http://backend` 保留重写后的路径。上游使用 HTTPS 时写 `proxy_pass https://backend`；`proxy_ssl_verify` 与 Nginx 一样默认 `off`，需要校验时显式开启并给出 `proxy_ssl_trusted_certificate`。
+
+响应改写的语义与 C 版一致：
+
+```nginx
+location /app/ {
+    proxy_pass http://backend/;
+
+    # 默认规则：把上游自身的地址改写成客户端看到的地址（等价于 proxy_pass 的 URL 前缀）
+    proxy_redirect default;
+
+    # 显式规则：左侧可为字面前缀或 ~ 正则，右侧可含变量
+    proxy_redirect http://backend.internal/ /app/;
+    proxy_redirect ~^http://([^/]+)(/.*)$ http://$host$2;
+
+    # Cookie 属性改写
+    proxy_cookie_domain backend.local example.com;
+    proxy_cookie_path /proxy/ /app/;
+    proxy_cookie_flags sid secure samesite=strict;   # 也支持 nosecure/nohttponly/samesite=off
+
+    # 上游响应头的取舍
+    proxy_hide_header X-Powered-By;
+    proxy_pass_header X-Accel-Expires;
+}
+```
 
 ## realip
 
@@ -247,11 +279,44 @@ http {
 
 ```powershell
 nginxrs -c conf/nginxrs.conf -s reload   # 原子重载；配置有误会报错并保留旧配置
-nginxrs -c conf/nginxrs.conf -s stop
+nginxrs -c conf/nginxrs.conf -s stop      # 真正退出进程并清理 pid/控制描述符
 ```
 
-Unix 上 `kill -HUP <pid>` 触发同样的重载。`ssl_verify_client`、`ssl_ciphers`、`ssl_session_*`
-尚未实现，配置时会明确报错。
+Unix 上 `kill -HUP <pid>` 触发同样的重载。
+
+`ngx_http_ssl_module` 已按 C 版语义实现：`ssl_certificate` 支持 `name:path` 多证书并按 SNI 以
+hash → 通配符 → 正则 → `default` 的顺序选择（`ngx_ssl_certificate_cb`）；`ssl_verify_client` 的
+`off`/`on`/`optional`/`optional_no_ca`、`ssl_verify_depth` 链长与 `ssl_client_certificate`/`ssl_crl`；
+`ssl_session_cache`（`builtin`/`shared:NAME:SIZE`）与 `ssl_session_tickets`；`ssl_protocols`、
+`ssl_ciphers`（OpenSSL 密码串语法，如 `HIGH:!aNULL:!MD5`）与 `ssl_ecdh_curve`；以及 `$ssl_*` 变量族。
+`ssl_reject_handshake on` 允许该 `server` 不配置证书并以 `unrecognized_name` 拒绝握手；
+`ssl_stapling on` 从 `ssl_stapling_file`（DER/PEM）取值，或在只配置 `ssl_stapling_responder`
+时于配置加载阶段向 responder 拉取 OCSP 响应，再 stapling 到叶子证书。
+`ssl_stapling_verify on` 会校验 responder 返回的响应（状态、`CertID` 匹配、`thisUpdate`/`nextUpdate`、
+撤销状态），不合法时配置加载失败。受 rustls 限制无法真正生效的部分（TLS 1.0/1.1、`ssl_dhparam`、
+`ssl_password_file`）会在 `-t` 时明确报告。
+
+```nginx
+server {
+    listen 443 ssl default_server;
+    ssl_certificate     a.example.com:cert/a.pem;    # name:path，按 SNI 选择
+    ssl_certificate_key a.example.com:cert/a.key;
+    ssl_certificate     default:cert/default.pem;
+    ssl_certificate_key default:cert/default.key;
+    ssl_verify_client   optional_no_ca;
+    ssl_session_cache   shared:SSL:10m;
+    add_header X-Client-Verify $ssl_client_verify always;
+}
+
+# 到上游的 TLS
+location /api/ {
+    proxy_pass              https://backend;
+    proxy_ssl_server_name   on;
+    proxy_ssl_verify        on;
+    proxy_ssl_trusted_certificate certs/upstream-ca.pem;
+}
+```
+
 
 ## 测试
 
@@ -271,13 +336,49 @@ cargo clippy --all-targets -- -D warnings
 - `limit_conn` 在首个请求未完成时拒绝并发请求；
 - `stub_status` 与 Prometheus 输出格式；
 - `-s reload` 生效、坏配置被拒绝且服务不中断；
-- 自签证书下的真实 HTTPS 握手（无 openssl 时自动跳过）。
+- 自签证书下的真实 HTTPS 握手（无 openssl 时自动跳过）；
+- `$ssl_protocol`/`$ssl_cipher`/`$ssl_server_name`/`$ssl_client_verify`/`$https` 反映握手的真实结果；
+- 同一监听上的两个 TLS `server {}` 由 SNI 分别选中各自的证书（`ngx_http_ssl_servername`）；
+- `proxy_set_header` 中的变量（`$host`、`$request_uri`、`$request_method`）在发往上游前求值，
+  `proxy_pass http://backend/v1/` 按 Nginx 规则替换匹配前缀；
+- `proxy_redirect default`/显式规则/`off` 三种行为，以及 `proxy_cookie_domain`/`proxy_cookie_path`/
+  `proxy_cookie_flags` 对 `Set-Cookie` 的改写结果；
+- `proxy_method`、`proxy_pass_request_body`、`proxy_set_body` 对上游请求的影响；
+- `proxy_cache`：第二个请求命中缓存且上游只被访问一次、不同 `proxy_cache_key` 分开存储、
+  `proxy_cache_bypass` 直连上游、无 `proxy_cache_valid` 且无过期头时不缓存、未知缓存域在 `-t` 时报错、
+  带 `Set-Cookie` 的响应默认不缓存（`proxy_ignore_headers Set-Cookie` 可放行）；
+- `ssl_reject_handshake`：未匹配的 `server_name` 握手失败，且该 `server` 无需证书即可通过 `-t`；
+- `ssl_session_cache shared:...`：客户端复用会话时 `$ssl_session_reused` 报 `r`；
+- `ssl_verify_client on` + `ssl_verify_depth`：受信 CA 签发的客户端证书得到 `SUCCESS`，
+  未知 CA 签发的被拒绝；
+- `ssl_stapling_responder`：配置加载阶段确实向 responder 发出 OCSP 请求；
+- `ssl_stapling_verify on`：伪造的 OCSP 响应会让 `-t` 失败；
+- `listen ... http2`：客户端只提供 `h2` 时 ALPN 协商成功且服务端以 SETTINGS 帧应答；
+- `-s stop`：进程真正退出并关闭监听端口；`listen`/`upstream server` 接受主机名；
+- `ssl_early_data on`：TLS 1.3 下客户端可尝试 0-RTT，`$ssl_early_data` 反映实际结果。
+- `proxy_next_upstream`：`http_503` 触发重试并最终由健康节点应答、默认 `error timeout` 不对状态码重试、
+  连接失败默认重试、`off` 关闭重试、`proxy_next_upstream_tries 1` 限制尝试次数、
+  非幂等请求（`POST`）需要 `non_idempotent` 才会重试；
+- `proxy_buffering`：超大响应经 `proxy_temp_path` 转存后完整送达、`proxy_buffering off` 逐块转发、
+  `proxy_max_temp_file_size 0` 关闭转存仍不丢数据。
 
 ## 与官方 C 源码的对照
 
 模块实现前会先阅读 `c/nginx/src/http/modules` 下的对应 C 文件，核对指令表、合并规则与请求阶段。
 已据此修正的差异包括：`$binary_remote_addr` 缺失、直连 `proxy_pass` 未注册上游、
-`return` 过早求值、`limit_conn` 槽位生命周期、realip 的端口与主机名语义。
+`return` 过早求值、`limit_conn` 槽位生命周期、realip 的端口与主机名语义、
+`ssl_session_cache` 的容量换算（`size / 128`）、`ssl_verify_depth` 的 `+1` 链长语义、
+`ssl_certificate` 的 SNI 选择顺序、`proxy_ssl_verify` 默认 `off`、
+`proxy_redirect default` 的模式（`proxy_pass` 的 URL 前缀而不是已解析的上游地址）、
+`proxy_pass http://host/` 在前缀完全匹配时仍然发送 `/`、
+`proxy_next_upstream` 只在确实还能换一个节点时才把状态码当作上游失败（否则把上游的 500 原样返回给客户端）。
+
+## 已知的运行时限制
+
+- Pingora 的 `HttpProxy` 只对 `ProxyHttp` 实现 `ServerApp`，因此下游由 `core::http_core::Bridge`
+  负责 TLS 终止与会话循环，`HttpCoreApp::route_request` 提供全部阶段；`proxy_pass` 由
+  `HttpCoreApp::proxy_pass` 直接驱动上游 HTTP/1 会话。
+- `proxy_request_buffering` 恒为 `on`（请求体先读完再连上游），没有临时文件落盘。
 
 ## 边界与后续路线
 

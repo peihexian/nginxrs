@@ -19,6 +19,25 @@ pub fn split_target(target: &str) -> (String, Option<String>) {
         .unwrap_or_else(|| (target.to_string(), None))
 }
 
+/// Set the request-line path and arguments (`ngx_http_set_exten` + `r->args`).
+pub fn set_request_uri(
+    request: &mut crate::core::http::RequestLine,
+    path: &str,
+    args: Option<&str>,
+) {
+    let (path, target_args) = split_target(path);
+    request.path = path.clone();
+    request.args = args
+        .map(str::to_string)
+        .or(target_args)
+        .unwrap_or_default();
+    request.uri = if request.args.is_empty() {
+        path
+    } else {
+        format!("{}?{}", request.path, request.args)
+    };
+}
+
 /// Set the URI on a pingora request header.
 pub fn set_uri(
     request: &mut pingora_http::RequestHeader,

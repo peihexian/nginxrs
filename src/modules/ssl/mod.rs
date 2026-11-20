@@ -1,4 +1,4 @@
-﻿//! `ngx_http_ssl_module`.
+//! `ngx_http_ssl_module`.
 //!
 //! Nginx enables HTTPS with `listen ... ssl` and configures TLS through the SSL module's
 //! directives. This module mirrors `c/nginx/src/http/modules/ngx_http_ssl_module.c`:
@@ -17,6 +17,8 @@ pub mod conf;
 pub mod config;
 pub mod crypto;
 pub mod sessions;
+pub mod ocsp_verify;
+pub mod stapling;
 pub mod variables;
 
 use crate::core::state::StateAccess;
@@ -229,7 +231,13 @@ impl SslModuleState {
             return Ok(());
         }
         // `ngx_http_ssl_merge_srv_conf` validations.
+        // `ssl_reject_handshake on` makes a certificate optional
+        // (`sscf->certificates == NULL` is accepted in that branch).
         if merged.certificates.is_empty() {
+            if merged.reject_handshake == Some(true) {
+                self.servers[index] = merged;
+                return Ok(());
+            }
             bail!(
                 "no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive in {}",
                 describe_server(index, server_names)
@@ -294,7 +302,9 @@ impl SslModuleState {
         };
         let mut servers = std::collections::HashMap::new();
         for (index, conf) in self.servers.iter().enumerate() {
-            if conf.certificates.is_empty() {
+            // `ssl_reject_handshake on` allows a server without certificates
+            // (`ngx_http_ssl_merge_srv_conf` returns early only when not rejecting).
+            if conf.certificates.is_empty() && conf.reject_handshake != Some(true) {
                 continue;
             }
             let resolver = Arc::new(certificates::load_resolver(conf, &provider)?);
@@ -641,7 +651,7 @@ fn ssl_session_cache(view: &mut crate::modules::DirectiveView<'_>) -> Result<()>
                 return Err(directive.error("duplicate value in \"ssl_session_cache\""));
             }
             let size = crate::core::value::parse_size(directive, size)? as usize;
-            if size < 8 * 1024 || size > 512 * 1024 * 1024 {
+            if !(8 * 1024..=512 * 1024 * 1024).contains(&size) {
                 return Err(directive.error(
                     "zone size must be between 8k and 512m",
                 ));
@@ -860,7 +870,7 @@ fn ssl_ocsp_cache(view: &mut crate::modules::DirectiveView<'_>) -> Result<()> {
         directive.error("invalid zone \"shared\"; expected shared:NAME:SIZE")
     })?;
     let size = crate::core::value::parse_size(directive, size)? as usize;
-    if size < 8 * 1024 || size > 512 * 1024 * 1024 {
+    if !(8 * 1024..=512 * 1024 * 1024).contains(&size) {
         return Err(directive.error("zone size must be between 8k and 512m"));
     }
     let _ = name;
@@ -894,17 +904,20 @@ pub fn virtual_hosts(
         if listens.iter().any(|listen| listen.default_server) {
             default = servers.len();
         }
+        let mut reject_handshake = false;
         if let Some(state) = config
             .module_states
             .get::<SslModuleState>(MODULE_NAME)
             .and_then(|state| state.server(index))
         {
             buffer = state.settings().buffer_size;
+            reject_handshake = state.reject_handshake_enabled();
         }
         servers.push(config::TlsVirtualServer {
             index,
             server_names: server.server_names.clone(),
             config: server_config.clone(),
+            reject_handshake,
         });
     }
     if servers.is_empty() {

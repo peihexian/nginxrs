@@ -327,7 +327,7 @@ impl VariableProvider for SslClientSubjectDn {
     }
     fn get(&self, state: &RequestState) -> Option<String> {
         let der = session(state)?.client_chain.first()?;
-        Some(subject_dn(der)?)
+        subject_dn(der)
     }
 }
 
@@ -339,7 +339,7 @@ impl VariableProvider for SslClientIssuerDn {
     }
     fn get(&self, state: &RequestState) -> Option<String> {
         let der = session(state)?.client_chain.first()?;
-        Some(issuer_dn(der)?)
+        issuer_dn(der)
     }
 }
 
@@ -351,7 +351,7 @@ impl VariableProvider for SslClientSubjectDnLegacy {
     }
     fn get(&self, state: &RequestState) -> Option<String> {
         let der = session(state)?.client_chain.first()?;
-        Some(subject_dn(der)?)
+        subject_dn(der)
     }
 }
 
@@ -363,7 +363,7 @@ impl VariableProvider for SslClientIssuerDnLegacy {
     }
     fn get(&self, state: &RequestState) -> Option<String> {
         let der = session(state)?.client_chain.first()?;
-        Some(issuer_dn(der)?)
+        issuer_dn(der)
     }
 }
 

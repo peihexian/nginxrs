@@ -106,6 +106,35 @@ impl Upstream {
         &self.name
     }
 
+    /// Number of configured backends, used to bound `proxy_next_upstream_tries` the way
+    /// `ngx_http_upstream_init_request` uses `peer.init`'s peer count.
+    pub fn peer_count_hint(&self) -> usize {
+        match &self.balancer {
+            Balancer::RoundRobin(lb) => lb.backends().get_backend().len(),
+            Balancer::Random(lb) => lb.backends().get_backend().len(),
+            Balancer::IpHash(lb) => lb.backends().get_backend().len(),
+            Balancer::LeastConn(lb) => lb.backends().get_backend().len(),
+        }
+    }
+
+    /// Select a healthy backend, excluding addresses that already failed this request
+    /// (`ngx_http_upstream_next` frees the failed peer before the next attempt).
+    pub fn select_avoiding(&self, key: &[u8], avoid: &[String]) -> Option<SelectedBackend> {
+        if avoid.is_empty() {
+            return self.select(key);
+        }
+        for offset in 0..self.peer_count_hint().max(1) {
+            let mut attempt_key = key.to_vec();
+            attempt_key.push(b'#');
+            attempt_key.extend_from_slice(offset.to_string().as_bytes());
+            let selected = self.select(&attempt_key)?;
+            if !avoid.iter().any(|address| address == &selected.address) {
+                return Some(selected);
+            }
+        }
+        None
+    }
+
     /// Select a healthy backend. `key` feeds hash-based algorithms and retry variation.
     pub fn select(&self, key: &[u8]) -> Option<SelectedBackend> {
         let backend = match &self.balancer {

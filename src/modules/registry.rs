@@ -53,11 +53,12 @@ impl Registry {
     /// [`crate::modules`], and add one line here.
     pub fn default_modules() -> Self {
         use crate::modules::{
-            access, body, headers, http_core, limit_conn, limit_req, log, lua, proxy, realip,
-            rewrite, ssl, static_files, stub_status, upstream,
+            access, body, error_page, headers, http_core, limit_conn, limit_req, log, lua, proxy,
+            realip, rewrite, ssl, static_files, stub_status, upstream,
         };
         Self::new(vec![
             Arc::new(http_core::HttpCoreModule),
+            Arc::new(error_page::ErrorPageModule),
             Arc::new(rewrite::RewriteModule),
             Arc::new(realip::RealipModule),
             Arc::new(access::AccessModule),

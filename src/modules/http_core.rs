@@ -104,7 +104,7 @@ fn dispatch_to_compiler(_: &mut crate::modules::DirectiveView<'_>) -> Result<()>
 /// `http {}`-level MIME configuration (`types`, `default_type`).
 #[derive(Clone, Debug, Default)]
 pub struct MimeConfig {
-    /// extension (lowercase) 鈫?content type
+    /// extension (lowercase) 閳?content type
     pub types: std::collections::HashMap<String, String>,
     pub default_type: String,
 }
@@ -561,8 +561,7 @@ pub fn parse_listen(directive: &Directive) -> Result<ListenConfig> {
     let mut default_server = false;
     let mut tls = false;
     let mut http2 = false;
-    let mut options = directive.args[1..].iter();
-    while let Some(option) = options.next() {
+    for option in &directive.args[1..] {
         match option.as_str() {
             "default_server" | "default" => default_server = true,
             // `ssl` marks the listener for the SSL module; `http2` advertises h2 through
