@@ -358,48 +358,33 @@ location /api/ {
 ## 测试
 
 ```powershell
-cargo test --all-targets -- --test-threads=1
+cargo test --all-targets -- --test-threads=1   # 单元测试 + 端到端测试
 cargo clippy --all-targets -- -D warnings
 ```
 
-集成测试会真实启动 nginxrs 与 TCP/慢速后端，覆盖：
+端到端测试按领域拆成 `tests/core`、`tests/proxy`、`tests/tls` 三个目录，每个文件是独立的
+测试 crate，共 52 个用例；共享的启动器、后端、证书与断言在 `tests/support/`。目录约定与
+新增测试的方法见 [docs/PROJECT_LAYOUT.md](docs/PROJECT_LAYOUT.md)。
 
-- 静态文件、HEAD、Range、HLS MIME、重写与重定向；
-- Lua 内容与响应头过滤器、`add_header` 链路；
-- 两个上游都收到请求（负载均衡）；
-- realip 改写 `$remote_addr`、保留 `$realip_remote_addr`、`proxy_set_header` 透传真实客户端、未配置受信网段时不改写；
-- `allow`/`deny` 的 CIDR 匹配与 403；
-- `limit_req` 超限返回 429 与 `$limit_req_status`；
-- `limit_conn` 在首个请求未完成时拒绝并发请求；
-- `stub_status` 与 Prometheus 输出格式；
-- `-s reload` 生效、坏配置被拒绝且服务不中断；
-- 自签证书下的真实 HTTPS 握手（无 openssl 时自动跳过）；
-- `$ssl_protocol`/`$ssl_cipher`/`$ssl_server_name`/`$ssl_client_verify`/`$https` 反映握手的真实结果；
-- 同一监听上的两个 TLS `server {}` 由 SNI 分别选中各自的证书（`ngx_http_ssl_servername`）；
-- `proxy_set_header` 中的变量（`$host`、`$request_uri`、`$request_method`）在发往上游前求值，
-  `proxy_pass http://backend/v1/` 按 Nginx 规则替换匹配前缀；
-- `proxy_redirect default`/显式规则/`off` 三种行为，以及 `proxy_cookie_domain`/`proxy_cookie_path`/
-  `proxy_cookie_flags` 对 `Set-Cookie` 的改写结果；
-- `proxy_method`、`proxy_pass_request_body`、`proxy_set_body` 对上游请求的影响；
-- `proxy_cache`：第二个请求命中缓存且上游只被访问一次、不同 `proxy_cache_key` 分开存储、
-  `proxy_cache_bypass` 直连上游、无 `proxy_cache_valid` 且无过期头时不缓存、未知缓存域在 `-t` 时报错、
-  带 `Set-Cookie` 的响应默认不缓存（`proxy_ignore_headers Set-Cookie` 可放行）；
-- `ssl_reject_handshake`：未匹配的 `server_name` 握手失败，且该 `server` 无需证书即可通过 `-t`；
-- `ssl_session_cache shared:...`：客户端复用会话时 `$ssl_session_reused` 报 `r`；
-- `ssl_verify_client on` + `ssl_verify_depth`：受信 CA 签发的客户端证书得到 `SUCCESS`，
-  未知 CA 签发的被拒绝；
-- `ssl_stapling_responder`：配置加载阶段确实向 responder 发出 OCSP 请求；
-- `ssl_stapling_verify on`：伪造的 OCSP 响应会让 `-t` 失败；
-- `listen ... http2`：客户端只提供 `h2` 时 ALPN 协商成功且服务端以 SETTINGS 帧应答；
-- `-s stop`：进程真正退出并关闭监听端口；`listen`/`upstream server` 接受主机名；
-- `proxy_http_version` 默认 1.1、`proxy_buffers` 默认 8×pagesize 且至少 2 个缓冲区；
-- 发往上游时清除 `Connection`/`Keep-Alive`/`TE`/`Upgrade`/`Expect`，默认补 `Connection: close`；
-- `ssl_early_data on`：TLS 1.3 下客户端可尝试 0-RTT，`$ssl_early_data` 反映实际结果。
-- `proxy_next_upstream`：`http_503` 触发重试并最终由健康节点应答、默认 `error timeout` 不对状态码重试、
-  连接失败默认重试、`off` 关闭重试、`proxy_next_upstream_tries 1` 限制尝试次数、
-  非幂等请求（`POST`）需要 `non_idempotent` 才会重试；
-- `proxy_buffering`：超大响应经 `proxy_temp_path` 转存后完整送达、`proxy_buffering off` 逐块转发、
-  `proxy_max_temp_file_size 0` 关闭转存仍不丢数据。
+| 目录 | 文件 | 覆盖内容 |
+| --- | --- | --- |
+| `tests/core` | `static_and_lua.rs` | 静态文件、HEAD、Range、HLS MIME、`try_files`、rewrite、Lua 内容/响应头、两个上游的负载均衡 |
+| | `realip.rs` | realip 改写 `$remote_addr`、保留 `$realip_remote_addr`、`proxy_set_header` 透传、未配置受信网段时不改写 |
+| | `access_and_limits.rs` | `allow`/`deny` 的 CIDR 匹配、`limit_req` 429 与 `$limit_req_status`、`limit_conn` 并发拒绝、`stub_status` 与 Prometheus |
+| | `lifecycle.rs` | `-s reload` 生效且坏配置被拒、`-s stop` 真正退出并关闭端口 |
+| `tests/proxy` | `request_shaping.rs` | `proxy_set_header` 变量求值、`proxy_pass` 前缀替换、未知 `proxy_*` 指令报错 |
+| | `response_rewriting.rs` | `proxy_redirect` 三种行为、`proxy_cookie_*`、`proxy_method`、`proxy_pass_request_body`、`proxy_set_body` |
+| | `next_upstream.rs` | `http_503` 重试、默认不重试状态码、连接错误默认重试、`off`、`tries`、非幂等请求需 `non_idempotent` |
+| | `buffering.rs` | 大响应经 `proxy_temp_path` 转存、`proxy_buffering off`、`proxy_max_temp_file_size 0`、`proxy_buffers` 至少 2 个 |
+| | `cache.rs` | 第二次命中且上游只访问一次、`proxy_cache_key`、`proxy_cache_bypass`、无 `proxy_cache_valid` 不缓存、未知缓存域报错 |
+| | `error_pages.rs` | `proxy_intercept_errors` 走 `error_page`、未开启时透传上游响应体、本地 404 的 `error_page` |
+| | `headers.rs` | `proxy_pass_header` 恢复默认隐藏头、上游 `Server` 默认隐藏、`X-Accel-*` 不透传、hop-by-hop 清理、`proxy_http_version` |
+| `tests/tls` | `handshake.rs` | 真实握手、`$ssl_protocol`/`$ssl_cipher`/`$ssl_server_name`/`$https`、SNI 选证 |
+| | `reject_handshake.rs` | `ssl_reject_handshake` 拒绝未匹配名字且无需证书、`ssl_verify_client` 的受信/不受信证书 |
+| | `sessions_and_stapling.rs` | `ssl_session_cache` 复用报 `r`、`ssl_stapling_responder` 实际发起 OCSP 请求、伪造响应被 `-t` 拒绝 |
+| | `early_data_and_http2.rs` | `ssl_early_data` 0-RTT、`listen ... http2` 的 ALPN 协商与 SETTINGS 应答 |
+
+依赖 `openssl` 生成证书的用例在缺少该命令时打印 skip 并跳过。
 
 ## 与官方 C 源码的对照
 

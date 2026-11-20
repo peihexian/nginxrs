@@ -231,11 +231,10 @@ pub fn include_arguments(directives: &[Directive], out: &mut Vec<String>) {
     for directive in directives {
         if let Some(children) = &directive.children {
             include_arguments(children, out);
-        } else if directive.name == "include" {
-            if let Some(argument) = directive.args.first() {
+        } else if directive.name == "include"
+            && let Some(argument) = directive.args.first() {
                 out.push(argument.clone());
             }
-        }
     }
 }
 

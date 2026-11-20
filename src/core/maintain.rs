@@ -28,6 +28,7 @@ pub const STUB_MARKER: &str = "#vhosts-conf#";
 
 /// Options shared by `-b` and `-r`.
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct BeautifyOptions {
     pub indent: IndentStyle,
     /// Rewrite files on disk; otherwise only report what would change.
@@ -36,15 +37,6 @@ pub struct BeautifyOptions {
     pub verbose: bool,
 }
 
-impl Default for BeautifyOptions {
-    fn default() -> Self {
-        Self {
-            indent: IndentStyle::default(),
-            write: false,
-            verbose: false,
-        }
-    }
-}
 
 /// Outcome of a maintenance run.
 #[derive(Default, Debug)]
@@ -200,13 +192,11 @@ impl Ctx {
         for item in &self.source.items {
             if let Item::Directive(directive) = item
                 && directive.directive.name == "include"
-            {
-                if let Some(argument) = directive.directive.args.first() {
+                && let Some(argument) = directive.directive.args.first() {
                     for child in self.children_of(argument) {
                         entries.push(Entry::Child(Box::new(child.clone())));
                     }
                 }
-            }
             entries.push(Entry::Item(item.clone()));
         }
         entries
@@ -466,9 +456,9 @@ impl Ctx {
                 let Item::Directive(item) = item else {
                     continue;
                 };
-                if item.directive.children.is_none() && item.directive.name == "include" {
-                    if let Some(argument) = item.directive.args.first() {
-                        if source::expand_include(base, argument)
+                if item.directive.children.is_none() && item.directive.name == "include"
+                    && let Some(argument) = item.directive.args.first()
+                        && source::expand_include(base, argument)
                             .map(|paths| {
                                 paths
                                     .iter()
@@ -480,8 +470,6 @@ impl Ctx {
                         {
                             *found = argument.clone();
                         }
-                    }
-                }
                 walk(&item.body, base, target, found);
             }
         }
@@ -772,7 +760,7 @@ pub fn expand_includes(directives: &[Directive], files: &[SourceFile], base: &Pa
                 if let Ok(layout) = SourceText::parse(&path, &text) {
                     let inner = layout.directives();
                     let _ = inner;
-                    out.extend(expand_includes(&layout.directives(), files, &path.parent().unwrap_or(base).to_path_buf()));
+                    out.extend(expand_includes(&layout.directives(), files, path.parent().unwrap_or(base)));
                 }
             }
             continue;
@@ -840,14 +828,14 @@ pub fn tree_signature(files: &[SourceFile]) -> Vec<(usize, String, Vec<String>)>
     let mut rows = Vec::new();
     for (index, file) in files.iter().enumerate() {
         // A file that stands alone keeps its own tree. A merged fragment is not a tree:
-        // its statements belong to the block that includes it, so it adds no rows.
         if index > 0 && file.parent.is_some() {
-            if is_value_table(&file.directives) {
-                append_rows(&file.directives, 0, &mut rows);
-            } else if file.directives.iter().any(|directive| directive.has_block()) {
-                append_rows(&file.directives, 0, &mut rows);
+            // A value table (`mime.types`) or a file with blocks is a tree of its own;
+            // anything else is a fragment whose statements belong to its includer.
+            let standalone = is_value_table(&file.directives)
+                || file.directives.iter().any(|directive| directive.has_block());
+            if !standalone {
+                continue;
             }
-            continue;
         }
         append_rows(&file.directives, 0, &mut rows);
     }

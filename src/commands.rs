@@ -89,7 +89,6 @@ fn collect_includes(directives: &[crate::core::syntax::Directive], out: &mut Vec
     }
 }
 /// `-t`: validate a configuration file and everything it includes.
-
 pub fn test(config: &Path) -> Result<Config> {
     Config::load(config)
 }
@@ -595,16 +594,16 @@ fn verify(
     let root_dir = root.parent().unwrap_or(Path::new("."));
     let rendered_lookup: std::collections::HashMap<String, String> = outputs
         .iter()
-        .filter_map(|(path, text)| {
-            // The output path is the source path below the configuration directory; a
-            // file outside it keeps its own name.
+        .map(|(path, text)| {
+            // The output path is the source path below the configuration directory; a file
+            // outside it keeps its own name.
             let rel = path
                 .strip_prefix(Path::new(&ctx.rel).parent().unwrap_or(Path::new(".")))
                 .or_else(|_| path.strip_prefix(&ctx.rel))
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|_| PathBuf::from(path.file_name().unwrap_or_default()));
             let target = root_dir.join(rel);
-            Some((output_key(&target), text.clone()))
+            (output_key(&target), text.clone())
         })
         .collect();
     let output_root = root.parent().unwrap_or(Path::new(".")).join(&ctx.rel);
@@ -805,8 +804,10 @@ mod tests {
         let config = root.join("conf/nginx.conf");
         let before = test(&config).unwrap();
 
-        let mut options = BeautifyOptions::default();
-        options.write = true;
+        let options = BeautifyOptions {
+            write: true,
+            ..BeautifyOptions::default()
+        };
         let report = beautify(&config, &options).unwrap();
         assert!(!report.changed.is_empty());
 
@@ -834,8 +835,10 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         sample(&root);
         let config = root.join("conf/nginx.conf");
-        let mut options = BeautifyOptions::default();
-        options.write = true;
+        let options = BeautifyOptions {
+            write: true,
+            ..BeautifyOptions::default()
+        };
         beautify(&config, &options).unwrap();
         let snippet = std::fs::read_to_string(root.join("conf/snippets.conf")).unwrap();
         assert!(snippet.contains(STUB_MARKER), "{snippet}");
@@ -855,8 +858,10 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         sample(&root);
         let target = root.join("out");
-        let mut options = BeautifyOptions::default();
-        options.write = true;
+        let options = BeautifyOptions {
+            write: true,
+            ..BeautifyOptions::default()
+        };
         let report = recreate(&root.join("conf"), &target, &options).unwrap();
         assert!(report.files_rendered >= 4);
 
@@ -876,8 +881,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         sample(&root);
-        let mut options = BeautifyOptions::default();
-        options.write = true;
+        let options = BeautifyOptions {
+            write: true,
+            ..BeautifyOptions::default()
+        };
         let error = recreate(&root.join("conf"), &root.join("conf/copy"), &options)
             .unwrap_err()
             .to_string();

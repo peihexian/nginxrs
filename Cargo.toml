@@ -50,6 +50,68 @@ tokio-rustls = "0.26"
 url = "2.5"
 x509-parser = "0.16"
 
+[[test]]
+name = "static_and_lua"
+path = "tests/core/static_and_lua.rs"
+
+[[test]]
+name = "realip"
+path = "tests/core/realip.rs"
+
+[[test]]
+name = "access_and_limits"
+path = "tests/core/access_and_limits.rs"
+
+[[test]]
+name = "lifecycle"
+path = "tests/core/lifecycle.rs"
+
+[[test]]
+name = "request_shaping"
+path = "tests/proxy/request_shaping.rs"
+
+[[test]]
+name = "response_rewriting"
+path = "tests/proxy/response_rewriting.rs"
+
+[[test]]
+name = "next_upstream"
+path = "tests/proxy/next_upstream.rs"
+
+[[test]]
+name = "buffering"
+path = "tests/proxy/buffering.rs"
+
+[[test]]
+name = "cache"
+path = "tests/proxy/cache.rs"
+
+[[test]]
+name = "error_pages"
+path = "tests/proxy/error_pages.rs"
+
+[[test]]
+name = "headers"
+path = "tests/proxy/headers.rs"
+
+[[test]]
+name = "handshake"
+path = "tests/tls/handshake.rs"
+
+[[test]]
+name = "reject_handshake"
+path = "tests/tls/reject_handshake.rs"
+
+[[test]]
+name = "sessions_and_stapling"
+path = "tests/tls/sessions_and_stapling.rs"
+
+[[test]]
+name = "early_data_and_http2"
+path = "tests/tls/early_data_and_http2.rs"
+# End-to-end tests. Each file under `tests/` is a separate test crate, so the grouping
+# directories are declared explicitly. Shared helpers live in `tests/support/` and are
+# pulled in with `#[path = "../support/mod.rs"] mod support;`.
 [dev-dependencies]
 tempfile = "3.23"
 
@@ -57,7 +119,3 @@ tempfile = "3.23"
 lto = "thin"
 codegen-units = 1
 strip = true
-
-
-
-

@@ -360,7 +360,7 @@ fn lex_items(source: &str) -> Result<Vec<Lexed>> {
             '#' => {
                 let mut text = String::from("#");
                 let mut ended_line = false;
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if next == '\n' {
                         line += 1;
                         ended_line = true;
@@ -554,12 +554,11 @@ impl ItemParser<'_> {
                             .map(|lexed| &lexed.kind),
                         Some(LexedKind::RightBrace) | Some(LexedKind::Semicolon)
                     );
-                    if previous_is_close {
-                        if let Some(Item::Directive(last)) = items.last_mut() {
+                    if previous_is_close
+                        && let Some(Item::Directive(last)) = items.last_mut() {
                             append_trailing(&mut last.trailing, text);
                             continue;
                         }
-                    }
                     pending.push(text);
                 }
                 LexedKind::RightBrace => {
