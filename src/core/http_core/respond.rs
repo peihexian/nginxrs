@@ -1,4 +1,4 @@
-﻿//! Local responses: `error_page` dispatch and the header filter chain.
+//! Local responses: `error_page` dispatch and the header filter chain.
 //!
 //! `respond` is the single place where a locally generated response (from `return`, a
 //! module, or an upstream error) becomes bytes; it is also where
@@ -76,6 +76,11 @@ impl HttpCoreApp {
         let current = self.engine.load();
         let engine = &*current;
         let mut writer = ResponseWriter::new(status);
+        // `ngx_http_header_filter`: the `Server` line is generated for every response unless
+        // the location hides it (`server_tokens off`).
+        writer
+            .set_header("Server", self.server_header(ctx, engine))
+            .ok();
         if !headers.is_empty() {
             writer
                 .set_header("Content-Type", "text/plain; charset=utf-8".to_string())

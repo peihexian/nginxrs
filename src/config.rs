@@ -101,6 +101,26 @@ impl Config {
                 variables.register(name, provider);
             }
         }
+        // `geo` blocks declare their variable while the block is parsed
+        // (`ngx_http_geo_block` → `ngx_http_add_variable`), so they are only known now.
+        if let Some(geo) = states
+            .iter()
+            .find(|(name, _)| *name == crate::modules::geo::MODULE_NAME)
+            .and_then(|(_, state)| state.get_ref::<crate::modules::geo::GeoBlocks>())
+        {
+            let providers = crate::modules::geo::providers(geo);
+            for (name, provider) in providers.iter().copied() {
+                variables.register(name, provider);
+            }
+            crate::modules::set_dynamic_providers(providers);
+        }
+        if let Some(geoip) = states
+            .iter()
+            .find(|(name, _)| *name == crate::modules::geoip::MODULE_NAME)
+            .and_then(|(_, state)| state.get_ref::<crate::modules::geoip::conf::Conf>())
+        {
+            crate::modules::geoip::publish(geoip);
+        }
 
         let mut module_states = ModuleStates::default();
         let mut warnings = Vec::new();

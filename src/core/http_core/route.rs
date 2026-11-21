@@ -1,4 +1,4 @@
-﻿//! The phase engine (`ngx_http_core_run_phases`).
+//! The phase engine (`ngx_http_core_run_phases`).
 //!
 //! `route_request` walks `POST_READ` -> `FIND_CONFIG` -> `REWRITE` -> `PREACCESS` ->
 //! `ACCESS` -> `CONTENT`, letting each module's handler decide whether to defer or
@@ -14,6 +14,14 @@ use crate::modules::uri;
 use http::StatusCode;
 use pingora_core::Result;
 use pingora_proxy::Session;
+
+/// What the phase engine must do after a rewrite action (`ngx_http_script` outcomes).
+enum RewriteStep {
+    /// `rewrite … last`: re-run configuration lookup from the top of the loop.
+    Restart,
+    /// The request is finished (`return`, redirect) or handed to a content phase.
+    Answered(PhaseOutcome),
+}
 
 impl HttpCoreApp {
     /// The Nginx phase engine for one request (`ngx_http_core_run_phases`).
@@ -98,6 +106,23 @@ impl HttpCoreApp {
 
             // `NGX_HTTP_REWRITE_PHASE`.
             if let Some(conf) = compiled.conf.get::<RewriteConf>().cloned() {
+                // `if`/`set`/`break` actions are compiled into the same script as the plain
+                // rewrite rules; nginx runs them in declaration order, so run them first.
+                let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
+                    session,
+                    &mut state,
+                    &compiled.conf,
+                    &ctx.server_name,
+                );
+                if let Some(outcome) = rewrite::apply_actions(&mut module_ctx, &conf) {
+                    match self
+                        .apply_rewrite_outcome(session, &mut state, ctx, outcome)
+                        .await?
+                    {
+                        RewriteStep::Restart => continue,
+                        RewriteStep::Answered(outcome) => return Ok(outcome),
+                    }
+                }
                 let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
                     session,
                     &mut state,
@@ -107,54 +132,12 @@ impl HttpCoreApp {
                 if let Some(outcome) =
                     rewrite::apply_rewrites(&mut module_ctx, &conf).map_err(engine_error)?
                 {
-                    match outcome {
-                        rewrite::RewriteOutcome::Redirect { status, target } => {
-                            let status = StatusCode::from_u16(status).map_err(engine_error)?;
-                            let location_header = vec![("Location".to_string(), target)];
-                            return self.respond(
-                                &mut state,
-                                session,
-                                ctx,
-                                status,
-                                "",
-                                &location_header,
-                            )
-                            .await;
-                        }
-                        rewrite::RewriteOutcome::Internal { target, restart } => {
-                            let (path, args) = uri::split_target(&target);
-                            state.request.path = path;
-                            if let Some(args) = args {
-                                state.request.args = args;
-                            }
-                            if restart {
-                                continue;
-                            }
-                            let Some(new_location) =
-                                engine.select_location(server, &state.request.path)
-                            else {
-                                return self.respond(
-                                    &mut state,
-                                    session,
-                                    ctx,
-                                    StatusCode::NOT_FOUND,
-                                    "404 Not Found\n",
-                                    &[],
-                                )
-                                .await;
-                            };
-                            return self
-                                .content_phase(
-                                    session,
-                                    &mut state,
-                                    ctx,
-                                    Selected {
-                                        server,
-                                        location: new_location,
-                                    },
-                                )
-                                .await;
-                        }
+                    match self
+                        .apply_rewrite_outcome(session, &mut state, ctx, outcome)
+                        .await?
+                    {
+                        RewriteStep::Restart => continue,
+                        RewriteStep::Answered(outcome) => return Ok(outcome),
                     }
                 }
                 if let Some(action) = rewrite::return_spec(&conf) {
@@ -248,6 +231,38 @@ impl HttpCoreApp {
                 .await;
             }
 
+            // `NGX_HTTP_ACCESS_PHASE`: `ngx_http_auth_basic_handler` runs before the Lua
+            // hook, exactly like the handler order in the C module's access phase.
+            if let Some(conf) = compiled
+                .conf
+                .get::<crate::modules::auth_basic::AuthBasicConf>()
+                .filter(|conf| conf.enabled())
+                .cloned()
+            {
+                let realm = conf.realm(&state).unwrap_or_default();
+                match crate::modules::auth_basic::handle(&conf, &state).await {
+                    crate::modules::auth_basic::AuthOutcome::Skip => {}
+                    crate::modules::auth_basic::AuthOutcome::Allowed => {}
+                    crate::modules::auth_basic::AuthOutcome::Rejected(failure) => {
+                        let status = StatusCode::from_u16(failure.status()).map_err(engine_error)?;
+                        let headers = if status == StatusCode::UNAUTHORIZED {
+                            vec![(
+                                "WWW-Authenticate".to_string(),
+                                crate::modules::auth_basic::challenge(&realm),
+                            )]
+                        } else {
+                            Vec::new()
+                        };
+                        let body = format!(
+                            "{}\n",
+                            status.canonical_reason().unwrap_or("Denied")
+                        );
+                        return self
+                            .respond(&mut state, session, ctx, status, &body, &headers)
+                            .await;
+                    }
+                }
+            }
             // `NGX_HTTP_ACCESS_PHASE` for `access_by_lua`.
             if let Some(hook) = compiled
                 .conf
@@ -322,3 +337,67 @@ impl HttpCoreApp {
     }
 }
 
+
+impl HttpCoreApp {
+    /// Apply one rewrite outcome: emit the response or pick the next location.
+    async fn apply_rewrite_outcome(
+        &self,
+        session: &mut Session,
+        state: &mut RequestState,
+        ctx: &mut RequestContext,
+        outcome: rewrite::RewriteOutcome,
+    ) -> Result<RewriteStep> {
+        match outcome {
+            rewrite::RewriteOutcome::Redirect { status, target } => {
+                let status = StatusCode::from_u16(status).map_err(engine_error)?;
+                let headers = vec![("Location".to_string(), target)];
+                self.respond(state, session, ctx, status, "", &headers)
+                    .await
+                    .map(RewriteStep::Answered)
+            }
+            rewrite::RewriteOutcome::Return(evaluated) => {
+                let status = StatusCode::from_u16(evaluated.status).map_err(engine_error)?;
+                let headers = evaluated
+                    .target
+                    .clone()
+                    .filter(|_| status.is_redirection())
+                    .map(|target| vec![("Location".to_string(), target)])
+                    .unwrap_or_default();
+                let body = if status.is_redirection() {
+                    String::new()
+                } else {
+                    evaluated.target.unwrap_or_default()
+                };
+                self.respond(state, session, ctx, status, &body, &headers)
+                    .await
+                    .map(RewriteStep::Answered)
+            }
+            rewrite::RewriteOutcome::Internal { target, restart } => {
+                let (path, args) = uri::split_target(&target);
+                state.request.path = path;
+                if let Some(args) = args {
+                    state.request.args = args;
+                }
+                if restart {
+                    return Ok(RewriteStep::Restart);
+                }
+                let Some(server) = ctx.selected.map(|selected| selected.server) else {
+                    return self
+                        .respond(state, session, ctx, StatusCode::NOT_FOUND, "404 Not Found\n", &[])
+                        .await
+                        .map(RewriteStep::Answered);
+                };
+                let current = self.engine.load();
+                let Some(location) = current.select_location(server, &state.request.path) else {
+                    return self
+                        .respond(state, session, ctx, StatusCode::NOT_FOUND, "404 Not Found\n", &[])
+                        .await
+                        .map(RewriteStep::Answered);
+                };
+                self.content_phase(session, state, ctx, Selected { server, location })
+                    .await
+                    .map(RewriteStep::Answered)
+            }
+        }
+    }
+}

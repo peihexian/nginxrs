@@ -45,7 +45,14 @@ impl Module for HttpCoreModule {
             spec("worker_processes", &[Context::Main], handler_main_directive),
             spec("user", &[Context::Main], handler_main_directive),
             spec("pid", &[Context::Main], handler_pid),
-            spec("error_log", &[Context::Main], handler_main_directive),
+            // `error_log` exists in every context (`ngx_http_core_loc_conf_t.error_log`);
+            // nginxrs writes a single process log, so scoped statements are accepted/noted.
+            spec("error_log", &[Context::Main], handler_scoped_error_log),
+            spec(
+                "error_log",
+                &[Context::Http, Context::Server, Context::Location],
+                handler_scoped_error_log,
+            ),
             spec("daemon", &[Context::Main], handler_main_directive),
             spec("master_process", &[Context::Main], handler_main_directive),
             spec(
@@ -64,6 +71,8 @@ impl Module for HttpCoreModule {
             spec("multi_accept", &[Context::Events], handler_events_child),
             spec("use", &[Context::Events], handler_events_child),
         ];
+        // Location/server settings owned by the core module but defined in `core_conf`.
+        specs.extend(crate::modules::core_conf::directives());
         // Structural directives are compiled by `HttpCompiler`, never by dispatch.
         for (name, contexts) in [
             ("http", &[Context::Main][..]),
@@ -416,10 +425,16 @@ impl<'a> HttpCompiler<'a> {
         if server_names.is_empty() {
             server_names.push(String::new());
         }
+        // `ngx_http_merge_locations` walks the server's implicit location with the server's
+        // own `loc_conf`, so a server-level module directive (`auth_basic`, `expires`, …)
+        // reaches every location through the same `inherit_from` used for `http {}`.
+        let inherited = server_location.clone();
         let mut locations = Vec::new();
         for node in location_nodes {
-            locations.push(self.compile_location(node, states, &server_location)?);
+            self.compile_location(node, states, &inherited, &mut locations)?;
         }
+        // A location that did not pick a configuration up from the server gets it here too:
+        // `children` are compiled with the server configuration as their parent.
         if locations.is_empty() {
             locations.push(CompiledLocation {
                 matcher: LocationMatcher::Prefix {
@@ -461,7 +476,8 @@ impl<'a> HttpCompiler<'a> {
         node: &Directive,
         states: &mut [StateSlot],
         server_location: &Location,
-    ) -> Result<CompiledLocation> {
+        flattened: &mut Vec<CompiledLocation>,
+    ) -> Result<()> {
         if !node.has_block() || node.args.is_empty() || node.args.len() > 2 {
             return Err(node.error("expected location [=|^~|~|~*] uri { ... }"));
         }
@@ -470,11 +486,9 @@ impl<'a> HttpCompiler<'a> {
         location.inherit_from(server_location);
         for child in node.block()? {
             match child.name.as_str() {
-                "location" => {
-                    return Err(
-                        child.error("nested locations are not implemented; use one location")
-                    );
-                }
+                // `ngx_http_add_location`: a nested block becomes its own entry that
+                // inherits this location; it is compiled after the parent body.
+                "location" => {}
                 _ => {
                     let base_dir = self.base_dir.clone();
                     let mut access = StateAccess::new(states);
@@ -489,11 +503,18 @@ impl<'a> HttpCompiler<'a> {
                 }
             }
         }
-        Ok(CompiledLocation {
+        flattened.push(CompiledLocation {
             pattern: matcher.describe(),
             matcher,
-            conf: location,
-        })
+            conf: location.clone(),
+        });
+        // Nested locations inherit the finished parent configuration.
+        for child in node.block()? {
+            if child.name == "location" {
+                self.compile_location(child, states, &location, flattened)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -547,6 +568,29 @@ fn handler_main_directive(view: &mut crate::modules::DirectiveView<'_>) -> Resul
             directive.line,
             directive.name
         ));
+    Ok(())
+}
+
+/// `error_log` inside `http`/`server`/`location`: accepted, the process log is shared.
+fn handler_scoped_error_log(view: &mut crate::modules::DirectiveView<'_>) -> Result<()> {
+    let directive = view.directive;
+    directive.expect_args_range(1..=2)?;
+    if let Some(level) = directive.args.get(1) {
+        if !matches!(
+            level.as_str(),
+            "debug" | "info" | "notice" | "warn" | "error" | "crit" | "alert" | "emerg" | "off"
+        ) {
+            return Err(directive.error("invalid log level"));
+        }
+    }
+    let note = format!(
+        "{}:{}: error_log {} is accepted, but nginxrs routes every level through the process log (RUST_LOG)",
+        directive.file.display(),
+        directive.line,
+        directive.args.join(" ")
+    );
+    let state: &mut crate::config::MainState = view.process_state()?;
+    state.warnings.push(note);
     Ok(())
 }
 

@@ -85,6 +85,8 @@ pub struct RequestContext {
     pub request: RequestHeader,
     pub selected: Option<Selected>,
     pub proxying: Option<Selected>,
+    /// The selected location uses `grpc_pass` (`ngx_http_grpc_handler`).
+    pub grpc: bool,
     /// Least-connections slot held while the request is in flight.
     pub backend: Option<SelectedBackend>,
     /// Realip state captured in the request filter (client address, original address).
@@ -165,6 +167,19 @@ impl ListenerTls {
 
 
 impl HttpCoreApp {
+    /// The `Server` header value for this response (`server_tokens`).
+    pub(crate) fn server_header(
+        &self,
+        ctx: &RequestContext,
+        engine: &Engine,
+    ) -> String {
+        ctx.selected
+            .and_then(|selected| engine.location(selected))
+            .and_then(|location| location.conf.get::<crate::modules::core_conf::TokensConf>())
+            .map(|tokens| tokens.0.header_value())
+            .unwrap_or_else(|| crate::SERVER_NAME.to_string())
+    }
+
     pub(crate) fn view(&self, ctx: &RequestContext) -> RequestStateView {
         RequestStateView {
             request: RequestLine::from_header(&ctx.request),
@@ -190,6 +205,7 @@ impl HttpCoreApp {
             body_bytes_sent: 0,
             limit_req_status: None,
             cache_status: ctx.cache_status.name(),
+            overrides: Vec::new(),
         }
     }
 

@@ -126,6 +126,16 @@ pub fn spawn_raw_backend(response: &'static str) -> u16 {
     spawn_raw_backend_on(0, response)
 }
 
+/// Answer every request with raw bytes (for bodies that are not UTF-8, like gzip).
+pub fn spawn_raw_backend_bytes(response: &'static [u8]) -> u16 {
+    let port = bind(0);
+    spawn_with(port, move |stream| {
+        let _ = read_request(stream);
+        let _ = stream.write_all(response);
+        let _ = stream.flush();
+    })
+}
+
 /// Bind the raw backend to `port` (`0` picks a free one) and return the bound port, so a
 /// response can refer to its own address.
 pub fn spawn_raw_backend_on(port: u16, response: &'static str) -> u16 {

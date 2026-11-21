@@ -56,6 +56,7 @@ impl HttpCoreApp {
                 .expect("placeholder request is valid"),
             selected: None,
             proxying: None,
+            grpc: false,
             backend: None,
             client: crate::core::http::ClientState::default(),
             connections: None,
@@ -88,6 +89,7 @@ impl HttpCoreApp {
             .map_or(0, |response| response.status.as_u16());
         let view = self.view(ctx);
         let mut state = view_as_state(&view, engine.providers);
+        state.apply_published_modules();
         state.body_bytes_sent = session.body_bytes_sent();
         state.status = session.response_written().map(|response| response.status);
         let message = error.map(|error| error.to_string());
@@ -182,21 +184,27 @@ impl HttpCoreApp {
         }
 
 
+        // `ngx_http_grpc_handler` is the content handler for a location with `grpc_pass`.
+        if compiled.conf.get::<crate::modules::grpc::GrpcConf>().is_some_and(|conf| conf.pass.is_some()) {
+            ctx.grpc = true;
+            ctx.proxying = Some(selected);
+            return Ok(PhaseOutcome::Proxy);
+        }
         if engine.upstream_for(compiled).is_some() {
             ctx.proxying = Some(selected);
             return Ok(PhaseOutcome::Proxy);
         }
-        if compiled
-            .conf
-            .get::<StaticConf>()
-            .is_some_and(|conf| conf.root.is_some())
-        {
+        // `ngx_http_static_handler`: serving needs a `root` or an `alias`.
+        if compiled.conf.get::<StaticConf>().is_some_and(|conf| {
+            conf.root.is_some() || conf.alias.is_some()
+        }) {
             let mut module_ctx = crate::modules::ctx::ModuleCtx::new(
                 session,
                 state,
                 &compiled.conf,
                 &ctx.server_name,
-            );
+            )
+            .with_prefix(&compiled.pattern);
             if static_files::handle(&mut module_ctx).await? {
                 return Ok(PhaseOutcome::Answered);
             }

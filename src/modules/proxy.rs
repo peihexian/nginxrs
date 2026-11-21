@@ -1,4 +1,4 @@
-﻿//! `ngx_http_proxy_module`: upstream proxying.
+//! `ngx_http_proxy_module`: upstream proxying.
 //!
 //! The adapter keeps Pingora's streaming pipeline; this module owns the directives,
 //! builds the request sent upstream, and applies the proxy response filters.
@@ -86,6 +86,8 @@ pub struct ProxyConf {
     pub max_temp_file_size: usize,
     /// `proxy_temp_path`.
     pub temp_path: Option<std::path::PathBuf>,
+    /// `proxy_temp_file_write_size`: bytes written to a temp file per write.
+    pub temp_file_write_size: Option<usize>,
     /// `proxy_next_upstream_timeout`, `0` disables the bound.
     pub next_upstream_timeout: Option<Duration>,
     /// `proxy_method`: an explicit method for the upstream request.
@@ -140,6 +142,7 @@ impl Default for ProxyConf {
             busy_buffers_size: None,
             max_temp_file_size: 1024 * 1024 * 1024,
             temp_path: None,
+            temp_file_write_size: None,
             next_upstream_timeout: None,
             next_upstream: UpstreamFailures(UpstreamFailures::DEFAULT),
             method: None,
@@ -336,6 +339,7 @@ impl Module for ProxyModule {
             spec("proxy_busy_buffers_size", parse_buffer_size),
             spec("proxy_max_temp_file_size", parse_size_directive),
             spec("proxy_temp_path", parse_temp_path),
+            spec("proxy_temp_file_write_size", parse_size_directive),
             spec("proxy_next_upstream_timeout", parse_next_upstream_timeout),
             spec("proxy_method", parse_method),
             spec("proxy_set_body", parse_set_body),

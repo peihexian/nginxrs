@@ -23,21 +23,47 @@ impl Engine {
     pub fn new(
         http: &HttpConfig,
         mut upstreams: HashMap<String, Arc<Upstream>>,
-        providers: &'static [(
-            &'static str,
-            &'static dyn crate::core::variables::VariableProvider,
-        )],
+        variables: &crate::core::variables::Variables,
         mime: crate::modules::http_core::MimeConfig,
         stats: Arc<crate::modules::stub_status::ServerStats>,
         access_log: Arc<AccessLogConfig>,
         access_writer: Option<Arc<AccessLogWriter>>,
         server_conf: Arc<pingora_core::server::configuration::ServerConf>,
     ) -> Self {
+        // The full variable table, including the variables `geo` registered while the
+        // configuration was compiled.
+        let providers: &'static [(
+            &'static str,
+            &'static dyn crate::core::variables::VariableProvider,
+        )] = Box::leak(variables.providers().to_vec().into_boxed_slice());
         // Direct `proxy_pass http://host:port` targets are not declared in an `upstream`
         // block; create a single-backend group for each so upstream selection and the
         // health-aware balancer work uniformly.
         for server in &http.servers {
             for location in &server.locations {
+                // `grpc_pass grpc://host:port` names a direct peer just like `proxy_pass`;
+                // `grpc://name` refers to an `upstream` block and needs nothing here.
+                if let Some(pass) = location
+                    .conf
+                    .get::<crate::modules::grpc::GrpcConf>()
+                    .and_then(|conf| conf.pass.as_ref())
+                    && !pass.is_group()
+                    && !upstreams.contains_key(&pass.upstream)
+                    && let Ok(upstream) = Upstream::new(&crate::modules::upstream::UpstreamConfig {
+                        name: pass.upstream.clone(),
+                        backends: vec![crate::modules::upstream::BackendConfig {
+                            address: pass.upstream.clone(),
+                            weight: 1,
+                            down: false,
+                            health: Default::default(),
+                        }],
+                        algorithm: crate::modules::upstream::LoadBalancingAlgorithm::RoundRobin,
+                        health_check_interval: None,
+                        keepalive: Default::default(),
+                    })
+                {
+                    upstreams.insert(pass.upstream.clone(), Arc::new(upstream));
+                }
                 let Some(pass) = location
                     .conf
                     .get::<ProxyConf>()
@@ -54,9 +80,11 @@ impl Engine {
                         address: pass.upstream.clone(),
                         weight: 1,
                         down: false,
+                        health: Default::default(),
                     }],
                     algorithm: crate::modules::upstream::LoadBalancingAlgorithm::RoundRobin,
                     health_check_interval: None,
+                    keepalive: Default::default(),
                 };
                 if let Ok(upstream) = Upstream::new(&config) {
                     upstreams.insert(pass.upstream.clone(), Arc::new(upstream));
@@ -146,7 +174,16 @@ impl Engine {
     }
 
     pub(crate) fn upstream_for(&self, location: &CompiledLocation) -> Option<Arc<Upstream>> {
-        let pass = location.conf.get::<ProxyConf>()?.pass.as_ref()?;
+        // `ngx_http_upstream_init`: a location is served by the upstream its proxy config
+        // names, whether that is `proxy_pass` or `grpc_pass`.
+        if let Some(pass) = location.conf.get::<ProxyConf>().and_then(|conf| conf.pass.as_ref()) {
+            return self.upstreams.get(&pass.upstream).cloned();
+        }
+        let pass = location
+            .conf
+            .get::<crate::modules::grpc::GrpcConf>()?
+            .pass
+            .as_ref()?;
         self.upstreams.get(&pass.upstream).cloned()
     }
 

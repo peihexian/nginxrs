@@ -33,6 +33,7 @@ impl ProxyHttp for HttpCoreApp {
                 .expect("placeholder request is valid"),
             selected: None,
             proxying: None,
+            grpc: false,
             backend: None,
             client: crate::core::http::ClientState::default(),
             connections: None,

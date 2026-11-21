@@ -5,6 +5,8 @@
 //! [`crate::modules::balancer`], keeping configuration and selection independently
 //! testable.
 
+pub mod options;
+
 use crate::core::syntax::Directive;
 use crate::core::value::{parse_time, parse_upstream_address};
 use crate::core::{Context, DirectiveSpec, Module, ModuleKind};
@@ -27,6 +29,8 @@ pub struct BackendConfig {
     pub address: String,
     pub weight: usize,
     pub down: bool,
+    /// `max_fails` / `fail_timeout` (passive health checking).
+    pub health: options::PassiveHealth,
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +39,8 @@ pub struct UpstreamConfig {
     pub backends: Vec<BackendConfig>,
     pub algorithm: LoadBalancingAlgorithm,
     pub health_check_interval: Option<Duration>,
+    /// `upstream { keepalive … }` (`ngx_http_upstream_keepalive_module`).
+    pub keepalive: options::KeepaliveConfig,
 }
 
 /// `http {}`-level upstream definitions.
@@ -84,6 +90,7 @@ fn parse_upstream_block(view: &mut crate::modules::DirectiveView<'_>) -> Result<
         backends: Vec::new(),
         algorithm: LoadBalancingAlgorithm::RoundRobin,
         health_check_interval: None,
+        keepalive: options::KeepaliveConfig::default(),
     };
     for child in directive.block()? {
         match child.name.as_str() {
@@ -110,7 +117,7 @@ fn parse_upstream_block(view: &mut crate::modules::DirectiveView<'_>) -> Result<
                 group.health_check_interval = Some(parse_time(child, interval)?);
             }
             "keepalive" | "keepalive_requests" | "keepalive_timeout" => {
-                return Err(child.error("upstream keepalive tuning is not implemented yet"));
+                options::parse_directive(child, &mut group.keepalive)?;
             }
             other => {
                 return Err(child.error(format!("unknown upstream directive \"{other}\"")));
@@ -137,6 +144,7 @@ fn parse_backend(node: &Directive) -> Result<BackendConfig> {
         address,
         weight: 1,
         down: false,
+        health: options::PassiveHealth::default(),
     };
     for option in &node.args[1..] {
         if let Some(weight) = option.strip_prefix("weight=") {
@@ -146,6 +154,8 @@ fn parse_backend(node: &Directive) -> Result<BackendConfig> {
             }
         } else if option == "down" {
             backend.down = true;
+        } else if options::parse_server_option(node, option, &mut backend.health)? {
+            // `max_fails=`/`fail_timeout=`.
         } else {
             return Err(node.error(format!("unsupported server option {option}")));
         }

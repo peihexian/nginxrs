@@ -279,15 +279,18 @@ mod tests {
                     address: "127.0.0.1:8001".into(),
                     weight: 1,
                     down: false,
+                    health: Default::default(),
                 },
                 BackendConfig {
                     address: "127.0.0.1:8002".into(),
                     weight: 1,
                     down: false,
+                    health: Default::default(),
                 },
             ],
             algorithm,
             health_check_interval: None,
+            keepalive: Default::default(),
         }
     }
 

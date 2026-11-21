@@ -28,6 +28,7 @@
 pub mod bridge;
 pub mod cache;
 pub mod content;
+mod grpc;
 pub mod engine;
 pub mod proxy;
 pub mod respond;

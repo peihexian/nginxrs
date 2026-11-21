@@ -16,6 +16,8 @@ pub struct ModuleCtx<'a> {
     pub server_name: &'a str,
     /// `types` / `default_type` from the `http {}` block.
     pub mime: MimeConfig,
+    /// Pattern of the selected location (`^~ /a/`, `~ \.php$`, …), for `root`/`alias` mapping.
+    pub prefix: String,
     pub responded: bool,
 }
 
@@ -27,6 +29,12 @@ impl<'a> ModuleCtx<'a> {
         server_name: &'a str,
     ) -> Self {
         Self::with_mime(session, state, location, server_name, MimeConfig::default())
+    }
+
+    /// Attach the selected location pattern, used by `root`/`alias` mapping.
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.prefix = prefix.to_string();
+        self
     }
 
     pub fn with_mime(
@@ -42,6 +50,7 @@ impl<'a> ModuleCtx<'a> {
             location,
             server_name,
             mime,
+            prefix: String::new(),
             responded: false,
         }
     }

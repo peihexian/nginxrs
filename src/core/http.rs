@@ -103,6 +103,8 @@ pub struct RequestState {
         &'static str,
         &'static dyn crate::core::variables::VariableProvider,
     )],
+    /// Values written by `set` and the SSI `set` command (`r->variables[index]`).
+    pub overrides: crate::core::variables::VariableOverrides,
     slots: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
@@ -128,6 +130,7 @@ impl RequestState {
             body_bytes_sent: 0,
             upstream_addr: String::new(),
             providers,
+            overrides: Default::default(),
             slots: HashMap::new(),
         }
     }
@@ -263,13 +266,29 @@ impl RequestState {
     /// Resolve a variable through built-ins and module providers. Unset variables
     /// resolve to `None`, which templates render as an empty string.
     pub fn variable(&self, name: &str) -> Option<String> {
+        // `ngx_http_get_indexed_variable`: a variable written by `set` shadows the handler.
+        if let Some(value) = self.overrides.get(name) {
+            return Some(String::from_utf8_lossy(value).into_owned());
+        }
         if let Some(value) = self.builtin_variable(name) {
             return Some(value);
         }
+        // `geo` registers one variable per block while the block is parsed
+        // (`ngx_http_add_variable` from `ngx_http_geo_block`), so those providers only appear
         self.providers
             .iter()
+            .chain(crate::modules::dynamic_providers().iter())
             .find(|(registered, _)| *registered == name)
             .and_then(|(_, provider)| provider.get(self))
+    }
+
+    /// Resolve a variable as raw bytes (`ngx_str_t`), for modules that must not lose data to
+    /// lossy UTF-8 conversion (SSI `echo encoding=none`, `set` values).
+    pub fn variable_bytes(&self, name: &str) -> Option<Vec<u8>> {
+        if let Some(value) = self.overrides.get(name) {
+            return Some(value.to_vec());
+        }
+        self.variable(name).map(String::into_bytes)
     }
 
     pub fn eval(&self, template: &Template) -> String {
@@ -310,6 +329,7 @@ impl RequestState {
                 .get::<crate::modules::proxy_cache::CacheState>()
                 .and_then(|cache| cache.status)
                 .map(|status| status.as_str()),
+            overrides: self.overrides.clone_values(),
         }
     }
 }
@@ -329,6 +349,8 @@ pub struct RequestStateView {
     pub limit_req_status: Option<&'static str>,
     /// `$upstream_cache_status` captured from the proxy exchange.
     pub cache_status: Option<&'static str>,
+    /// Values written by `set` (`r->variables`), visible to every later lookup.
+    pub overrides: Vec<(String, Vec<u8>)>,
 }
 
 impl RequestStateView {
@@ -397,6 +419,14 @@ impl RequestStateView {
     /// Resolve a variable. Module providers are not consulted for snapshots; the
     /// `realip_*` variables are built in and therefore always available.
     pub fn variable(&self, name: &str) -> Option<String> {
+        let lowered = name.to_ascii_lowercase();
+        if let Some((_, value)) = self
+            .overrides
+            .iter()
+            .find(|(existing, _)| *existing == lowered)
+        {
+            return Some(String::from_utf8_lossy(value).into_owned());
+        }
         match name {
             // `$upstream_cache_status` is kept in the snapshot because the cache decision
             // happens after the header filter needs the value.
@@ -424,6 +454,7 @@ impl RequestStateView {
             body_bytes_sent: self.body_bytes_sent,
             upstream_addr: self.upstream_addr,
             providers,
+            overrides: crate::core::variables::VariableOverrides::from_values(self.overrides),
             slots: HashMap::new(),
         };
         if let Some(cache_status) = self.cache_status {

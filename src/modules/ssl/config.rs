@@ -122,9 +122,7 @@ pub fn apply_cipher_expression(expression: &str, suites: &[&str]) -> Result<Vec<
             }
             names
         };
-        if matched.is_empty() && operation == '=' {
-            bail!("no ciphers available for {rest}");
-        }
+        // OpenSSL tolerates a selector that selects nothing (`SSL_CTX_set_cipher_list` only fails when the whole list ends up empty), and production configurations routinely name suites the runtime does not implement (DHE, 3DES, CBC).
         match operation {
             '=' => {
                 if result.is_empty() {
@@ -545,10 +543,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_cipher_expression_is_rejected() {
+    fn no_match_is_tolerated_like_openssl() {
         let suites = &["TLS13_AES_128_GCM_SHA256"];
-        assert!(apply_cipher_expression("NOT-A-CIPHER", suites).is_err());
-        // Exclusions alone leave the default set untouched (OpenSSL `!` semantics).
+        // OpenSSL only fails when the whole list ends up empty, so a selector that matches
+        // nothing (DHE, 3DES, CBC suites a runtime may not implement) is not an error.
+        assert!(apply_cipher_expression("NOT-A-CIPHER", suites).unwrap().is_empty());
         assert_eq!(
             apply_cipher_expression("!aNULL", suites).unwrap().len(),
             1

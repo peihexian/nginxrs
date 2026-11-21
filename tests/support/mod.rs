@@ -16,6 +16,7 @@
 pub mod backend;
 pub mod cert;
 pub mod client;
+pub mod grpc_backend;
 pub mod http;
 pub mod server;
 pub mod tlsc;
@@ -25,6 +26,7 @@ pub use cert::{Certificates, OpenSsl};
 pub use client::{h2_client, https_get, https_get_session, https_get_with};
 pub use http::{assert_response, assert_status, body, header, headers, request, status};
 pub use http::try_header;
+pub use http::{gzip_decode_bytes, is_gzip_encoded, raw_head, raw_request};
 pub use server::{
     ChildGuard, Server, config_path, free_port, run, start, temp_path, wait_until_closed,
     wait_until_ready,

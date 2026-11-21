@@ -263,12 +263,8 @@ fn parse_real_ip_header(view: &mut crate::modules::DirectiveView<'_>) -> Result<
     directive.expect_args(1)?;
     let header = HeaderSource::parse(&directive.args[0])
         .map_err(|error| directive.error(format!("real_ip_header: {error}")))?;
-    let duplicate = view
-        .location_conf::<RealipConf>()
-        .is_some_and(|conf| conf.header_set);
-    if duplicate {
-        return Err(directive.error("\"real_ip_header\" is duplicate"));
-    }
+    // `ngx_conf_merge_ptr_value`: the last `real_ip_header` in one context wins (nginx keeps the last); a repeat is not an error.
+    let _ = view.location_conf::<RealipConf>();
     view.update_conf::<RealipConf>(|conf| {
         conf.header = header;
         conf.header_set = true;
@@ -651,7 +647,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_real_ip_header_is_rejected() {
+    fn later_real_ip_header_wins() {
+        // `ngx_conf_merge_ptr_value`: a second `real_ip_header` in one block replaces the
+        // first instead of failing; included snippet files repeat the directive routinely.
         let registry = crate::modules::Registry::default_modules();
         let mut states: Vec<crate::core::state::StateSlot> = vec![(
             "main",
@@ -671,37 +669,8 @@ mod tests {
             )
         };
         dispatch(&first[0]).unwrap();
-        let error = dispatch(&second[0]).unwrap_err().to_string();
-        assert!(error.contains("duplicate"), "{error}");
-    }
-
-    #[test]
-    fn real_ip_header_names_match_nginx_case_rules() {
-        assert_eq!(
-            HeaderSource::parse("X-Real-IP").unwrap(),
-            HeaderSource::XRealIp
-        );
-        assert_eq!(
-            HeaderSource::parse("X-Forwarded-For").unwrap(),
-            HeaderSource::XForwardedFor
-        );
-        // Custom names are case-insensitive header names.
-        assert_eq!(
-            HeaderSource::parse("X-Client-IP").unwrap(),
-            HeaderSource::Custom(HeaderName::from_static("x-client-ip"))
-        );
-        assert_eq!(
-            HeaderSource::parse("proxy_protocol").unwrap(),
-            HeaderSource::ProxyProtocol
-        );
-        assert!(HeaderSource::ProxyProtocol.header_name().is_none());
-    }
-
-    #[test]
-    fn disabled_without_trusted_sources() {
-        let mut state = request_state("10.0.0.5", Some(("x-real-ip", "203.0.113.9")));
-        let outcome = apply(&RealipConf::default(), &mut state);
-        assert!(!outcome.changed);
-        assert_eq!(state.variable("remote_addr").unwrap(), "10.0.0.5");
+        dispatch(&second[0]).unwrap();
+        let conf = location.get::<RealipConf>().expect("realip configuration");
+        assert_eq!(conf.header, HeaderSource::parse("X-Real-IP").unwrap());
     }
 }

@@ -54,6 +54,30 @@ impl HttpCoreApp {
     /// (`ngx_http_proxy_create_request`), forwards the body and relays the response. Returns
     /// whether the downstream connection may be reused.
     pub async fn proxy_request(&self, session: &mut Session, ctx: &mut RequestContext) -> bool {
+        // `ngx_http_grpc_handler`: `grpc_pass` speaks HTTP/2 to the upstream.
+        if ctx.grpc {
+            return match self.grpc_pass(session, ctx).await {
+                Ok(keepalive) => keepalive,
+                Err(error) => {
+                    log::error!("grpc_pass failed: {error:#}");
+                    let status = ctx
+                        .upstream_status
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    let body = format!(
+                        "{}\n",
+                        status.canonical_reason().unwrap_or("Bad Gateway")
+                    );
+                    let current = self.engine.load();
+                    let providers = current.providers;
+                    let view = self.view(ctx);
+                    let mut state = view_as_state(&view, providers);
+                    self.respond(&mut state, session, ctx, status, &body, &[])
+                        .await
+                        .ok();
+                    false
+                }
+            };
+        }
         let outcome = self.proxy_pass(session, ctx).await;
         // `proxy_intercept_errors`: the withheld upstream response is processed like a local
         // one, so `error_page` and the core's own error pages apply to it.
@@ -297,7 +321,8 @@ impl HttpCoreApp {
         }
     }
 
-    /// One upstream attempt (`ngx_http_upstream_connect` 闂?`ngx_http_upstream_process_body`).
+    /// One upstream attempt (`ngx_http_upstream_connect` through
+    /// `ngx_http_upstream_process_body`).
     #[allow(clippy::too_many_arguments)]
     async fn proxy_attempt(
         &self,
@@ -477,6 +502,54 @@ impl HttpCoreApp {
                     })
                     .collect(),
             ));
+            return Ok(());
+        }
+
+        // `ngx_http_gunzip_filter_module` / `ngx_http_gzip_filter_module`: an encoded body is
+        // buffered, transformed and sent in one step. `proxy_buffering off` streams instead,
+        // so the filters only apply to buffered responses (the default).
+        let current = self.engine.load();
+        if let Some(location) = ctx
+            .proxying
+            .and_then(|selected| current.location(selected))
+            && crate::modules::filters::encode::enabled(&location.conf)
+        {
+            let mut payload = Vec::new();
+            while !ended {
+                match upstream_session.read_body_bytes().await {
+                    Ok(Some(chunk)) => {
+                        let done = upstream_session.is_body_done();
+                        payload.extend_from_slice(&chunk);
+                        ended = done;
+                    }
+                    Ok(None) => {
+                        ended = true;
+                    }
+                    Err(error) => {
+                        upstream_session.shutdown().await;
+                        return Err(proxy::UpstreamError::new(F::ERROR, error));
+                    }
+                }
+            }
+            upstream_session.shutdown().await;
+            let mut body = crate::modules::filters::encode::Body::new(payload);
+            crate::modules::filters::encode::apply(
+                &mut response,
+                &mut body,
+                &view,
+                &location.conf,
+                &state,
+                is_head,
+            )?;
+            let empty = is_head || body.is_empty();
+            session
+                .write_response_header(Box::new(response), empty)
+                .await?;
+            if !empty {
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body.bytes)), true)
+                    .await?;
+            }
             return Ok(());
         }
 

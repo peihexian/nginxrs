@@ -10,6 +10,55 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+/// Per-request variable values written by `set` (`ngx_http_script_set_var_code`) and by the
+/// SSI `set`/`include set=` commands.
+///
+/// Values are stored raw because nginx strings are byte strings; `$request_body`, header
+/// values and certificates are not required to be UTF-8.
+#[derive(Clone, Debug, Default)]
+pub struct VariableOverrides {
+    values: Vec<(String, Vec<u8>)>,
+}
+
+impl VariableOverrides {
+    /// Record a value, replacing an earlier one with the same (case-insensitive) name.
+    pub fn set(&mut self, name: &str, value: impl Into<Vec<u8>>) {
+        let name = name.to_ascii_lowercase();
+        let value = value.into();
+        if let Some(entry) = self
+            .values
+            .iter_mut()
+            .find(|(existing, _)| *existing == name)
+        {
+            entry.1 = value;
+        } else {
+            self.values.push((name, value));
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
+        let name = name.to_ascii_lowercase();
+        self.values
+            .iter()
+            .find(|(existing, _)| *existing == name)
+            .map(|(_, value)| value.as_slice())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Copy the values, for snapshots used by header filters.
+    pub fn clone_values(&self) -> Vec<(String, Vec<u8>)> {
+        self.values.clone()
+    }
+
+    /// Restore from a snapshot.
+    pub fn from_values(values: Vec<(String, Vec<u8>)>) -> Self {
+        Self { values }
+    }
+}
+
 /// A parsed template such as `"$remote_addr:$server_port"`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Template {
@@ -65,6 +114,27 @@ impl Template {
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// Drop a trailing query separator: nginx `ngx_http_script_compile` removes the last `?`
+    /// of a compiled complex value (`sc +zero`), so `return 301 /target?` produces a target
+    /// without a dangling `?`.
+    pub fn into_trimmed_bytes(self) -> Vec<u8> {
+        let mut bytes = self.source.into_bytes();
+        if bytes.last() == Some(&b'?') {
+            bytes.pop();
+        }
+        bytes
+    }
+
+    /// Evaluate a variable template through the given request state, then drop the trailing
+    /// `?` exactly like [`Template::into_trimmed_bytes`].
+    pub fn eval_trimmed(&self, state: &RequestState) -> String {
+        let mut value = self.eval(state);
+        if value.ends_with('?') {
+            value.pop();
+        }
+        value
     }
 
     pub fn is_literal(&self) -> bool {

@@ -23,12 +23,16 @@ pub enum LogTarget {
     /// `access_log off`.
     Off,
     File(std::path::PathBuf),
+    /// `access_log path format;` — the file plus the format it names.
+    Formatted(std::path::PathBuf, String),
 }
 
 #[derive(Clone, Default)]
 pub struct AccessLogConfig {
     pub formats: Vec<LogFormat>,
     pub target: Option<LogTarget>,
+    /// `access_log file format;` declared per location (`ngx_http_log_loc_conf_t`).
+    pub per_location: Vec<(Option<LogTarget>, Option<String>)>,
 }
 
 impl AccessLogConfig {
@@ -47,6 +51,15 @@ impl AccessLogConfig {
             .map(|format| &format.template)
     }
 
+    /// The format attached to the configured target, if the statement named one.
+    pub fn selected_format(&self) -> Option<&Template> {
+        match self.target.as_ref()? {
+            LogTarget::Formatted(_, name) => self.format(name),
+            LogTarget::File(_) => self.format("main"),
+            LogTarget::Off => None,
+        }
+    }
+
     /// Write one completed request line. Log failures never fail the request.
     pub fn log(
         &self,
@@ -55,8 +68,10 @@ impl AccessLogConfig {
         status: u16,
         error: Option<&str>,
     ) {
+        // `access_log ... format;` names the format; the `main` format is only the fallback
+        // when the writer was configured without one.
         let template = self
-            .format("main")
+            .selected_format()
             .cloned()
             .unwrap_or_else(Self::combined_template);
         let mut line = template.eval_with(&mut |name| {
@@ -135,6 +150,7 @@ impl Module for AccessLogModule {
     fn http_state(&self) -> Option<crate::core::StateInstance> {
         let config = AccessLogConfig {
             target: Some(LogTarget::Off),
+            per_location: Vec::new(),
             formats: vec![LogFormat {
                 name: "combined".to_string(),
                 template: AccessLogConfig::combined_template(),
@@ -152,7 +168,7 @@ impl Module for AccessLogModule {
             },
             DirectiveSpec {
                 name: "access_log",
-                contexts: &[Context::Http],
+                contexts: &[Context::Http, Context::Server, Context::Location],
                 handler: parse_access_log,
             },
         ]
@@ -186,7 +202,12 @@ fn parse_access_log(view: &mut crate::modules::DirectiveView<'_>) -> Result<()> 
     let target = if directive.args[0] == "off" {
         LogTarget::Off
     } else {
-        LogTarget::File(resolve_path(view.base_dir, &directive.args[0]))
+        let path = resolve_path(view.base_dir, &directive.args[0]);
+        match directive.args.get(1) {
+            // `access_log path format;` keeps the format with the target.
+            Some(format) => LogTarget::Formatted(path, format.clone()),
+            None => LogTarget::File(path),
+        }
     };
     if let Some(format) = directive.args.get(1) {
         let config = view.state::<AccessLogConfig>()?;
@@ -194,6 +215,15 @@ fn parse_access_log(view: &mut crate::modules::DirectiveView<'_>) -> Result<()> 
             return Err(directive.error(format!("unknown log format \"{format}\"")));
         }
     }
-    view.state::<AccessLogConfig>()?.target = Some(target);
+    let format = directive.args.get(1).cloned();
+    let scoped = matches!(view.context, Context::Server | Context::Location);
+    let config = view.state::<AccessLogConfig>()?;
+    // `http {}`-level statements select the process default; server/location statements are
+    // recorded per location, as `ngx_http_log_loc_conf_t.logs` keeps them.
+    if scoped {
+        config.per_location.push((Some(target), format));
+    } else {
+        config.target = Some(target);
+    }
     Ok(())
 }

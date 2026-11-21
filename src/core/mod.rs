@@ -1,8 +1,12 @@
 //! Building blocks shared by all Nginx-compatible modules.
 
+pub mod bytes;
+pub mod crypt;
+pub mod geo;
 pub mod http;
 pub mod http_core;
 pub mod layout;
+pub mod limits;
 pub mod maintain;
 pub mod reload;
 pub mod runner;

@@ -38,8 +38,22 @@ tests/
 │   ├── static_and_lua.rs        静态文件、Range、MIME、rewrite、Lua、负载均衡
 │   ├── realip.rs                realip 地址改写
 │   ├── access_and_limits.rs     allow/deny、limit_req、limit_conn、stub_status
+│   ├── directives.rs            server_tokens、expires、alias、max_ranges、access_log 作用域
+│   ├── rewrite_conditions.rs    if/set/break 条件与 file 测试
+│   ├── geo.rs                  geo 块、地址映射、转发链
+│   ├── geoip.rs                geoip 变量（国家/城市/坐标，测试内生成 .mmdb）
 │   └── lifecycle.rs             -s reload / -s stop
+├── filters/                     响应过滤器
+│   ├── gzip.rs                  gzip/gunzip 协商、压缩、`Vary`、HEAD
+│   ├── gzip_static.rs           `.gz` 兄弟文件（on/always/off）
+│   └── ssi.rs                   SSI 渲染、包含、errmsg/silent_errors
+│   └── ssi.rs                   SSI 渲染、包含、errmsg/silent_errors
+├── auth/                        认证
+│   └── basic.rs                 auth_basic 挑战、正确/错误口令、user file 缺失
+├── config/                      配置加载
+│   └── production_shape.rs      生产形态配置（占位值）整树 -t 与实跑
 ├── proxy/                       反向代理语义
+│   ├── grpc.rs                  grpc_pass：伪首部、trailers、upstream 组、失败 502
 │   ├── request_shaping.rs       proxy_set_header、URI 替换、未知指令校验
 │   ├── response_rewriting.rs    proxy_redirect、proxy_cookie_*、method/body
 │   ├── next_upstream.rs         重试策略（状态码、连接错误、次数、非幂等）

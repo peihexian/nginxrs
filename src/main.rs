@@ -7,7 +7,7 @@ use nginxrs::core::reload::{self, Reloader};
 use nginxrs::modules::balancer::Upstream;
 use nginxrs::modules::log::{AccessLogConfig, AccessLogWriter, LogTarget};
 use nginxrs::modules::stub_status::ServerStats;
-use nginxrs::modules::{PROVIDERS, ssl, upstream};
+use nginxrs::modules::{ssl, upstream};
 use pingora_core::server::Server;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::services::ServiceWithDependents;
@@ -308,7 +308,7 @@ fn build_engine(
     let engine = Engine::new(
         &config.http,
         upstreams,
-        PROVIDERS,
+        &config.variables,
         mime,
         stats,
         Arc::new(access_config),

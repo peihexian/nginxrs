@@ -61,6 +61,60 @@ pub fn body(response: &str) -> &str {
         .unwrap_or("")
 }
 
+/// Send a raw request and return the raw response bytes (headers and body).
+///
+/// A gzip body is not valid UTF-8, so a test that decodes it must not lose bytes to `&str`.
+pub fn raw_request(port: u16, request: &str) -> Vec<u8> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    response
+}
+
+/// `Content-Encoding: gzip` from raw response bytes (headers only).
+pub fn is_gzip_encoded(response: &[u8]) -> bool {
+    let headers_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or(response.len());
+    String::from_utf8_lossy(&response[..headers_end])
+        .lines()
+        .any(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-encoding")
+                        && value.trim().eq_ignore_ascii_case("gzip")
+                })
+        })
+}
+
+/// The raw headers of a response (up to the blank line).
+pub fn raw_head(response: &[u8]) -> String {
+    let headers_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or(response.len());
+    String::from_utf8_lossy(&response[..headers_end]).into_owned()
+}
+
+/// Decompress a `Content-Encoding: gzip` response body.
+///
+/// The body is taken as raw bytes: a gzip stream is not valid UTF-8, so it must not be
+/// round-tripped through `&str` (the test helper loses invalid sequences).
+pub fn gzip_decode_bytes(response: &[u8]) -> String {
+    let start = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .unwrap_or(0);
+    let mut decoder = flate2::read::GzDecoder::new(&response[start..]);
+    let mut decoded = String::new();
+    std::io::Read::read_to_string(&mut decoder, &mut decoded).ok();
+    decoded
+}
+
 /// Assert that the response has this status and exactly this body.
 pub fn assert_response(response: &str, expected_status: u16, expected_body: &str) {
     assert_eq!(status(response), expected_status, "{response}");

@@ -31,3 +31,13 @@ pub mod modules;
 
 pub const SERVER_NAME: &str = concat!("nginxrs/", env!("CARGO_PKG_VERSION"));
 
+/// `server_tokens build;` value: the version plus the build profile.
+pub fn server_build_name() -> String {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    format!("{SERVER_NAME} ({profile})")
+}
+
